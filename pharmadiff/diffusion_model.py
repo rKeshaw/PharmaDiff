@@ -30,7 +30,7 @@ from pharmadiff.metrics.molecular_metrics import TrainMolecularMetrics, Sampling
 from pharmadiff.diffusion.extra_features import ExtraFeatures
 from pharmadiff.analysis.rdkit_functions import Molecule
 from pharmadiff.datasets.adaptive_loader import effective_batch_size
-
+from pharmadiff.models.affinity_predictor import AffinityPredictor
 
 class FullDenoisingDiffusion(pl.LightningModule):
     model_dtype = torch.float32
@@ -54,6 +54,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.input_dims = self.extra_features.update_input_dims(dataset_infos.input_dims)
         self.output_dims = dataset_infos.output_dims
         # self.domain_features = ExtraMolecularFeatures(dataset_infos=dataset_infos)
+        self.affinity_model = AffinityPredictor(
+            ligand_in_dim=dataset_infos.input_dims.X, 
+            protein_in_dim=5 # Based on simple C,N,O,S,Other encoding
+        )
 
         # Train metrics
         self.train_loss = TrainLoss(lambda_train=self.cfg.model.lambda_train
@@ -95,6 +99,13 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                                          cfg=cfg)
         else:
             assert ValueError(f"Transition type '{cfg.model.transition}' not implemented.")
+      
+        if hasattr(cfg.model, 'affinity_weight_path') and cfg.model.affinity_weight_path:
+            print(f"Loading Affinity Model from {cfg.model.affinity_weight_path}")
+            state_dict = torch.load(cfg.model.affinity_weight_path)
+            self.affinity_model.load_state_dict(state_dict)
+            self.affinity_model.eval() # Keep frozen during generation
+            self.affinity_model.requires_grad_(False) # Standard freeze
 
         self.log_every_steps = cfg.general.log_every_steps
         self.number_chain_steps = cfg.general.number_chain_steps
@@ -467,10 +478,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
         
         z_t = z_T
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
+        g_scale = getattr(self.cfg.general, 'guidance_scale', 0.0)
         for s_int in reversed(range(0, self.T, 1 if test else self.cfg.general.faster_sampling)):
             s_array = s_int * torch.ones((batch_size, 1), dtype=torch.long, device=z_t.X.device)
 
-            z_s = self.sample_zs_from_zt(z_t=z_t, s_int=s_array)
+            z_s = self.sample_zs_from_zt(z_t=z_t, s_int=s_array, sample_condition=sample_condition, guidance_scale=g_scale)
 
             # Save the first keep_chain graphs
             if s_int != 0 and (s_int * number_chain_steps) % self.T == 0:
@@ -550,8 +562,33 @@ class FullDenoisingDiffusion(pl.LightningModule):
         _ = visualizer.visualize(result_path, molecule_list, num_molecules_to_visualize=save_final)
         self.print("Visualizing done.")
         return molecule_list
+    
+    def calculate_clash_gradient(self, z_t_pos, pocket_pos, threshold=1.5):
+        """
+        Calculates a repulsive force if ligand atoms get too close to protein atoms.
+        
+        Args:
+            z_t_pos: (N, 3) Ligand coordinates (Requires Grad)
+            pocket_pos: (M, 3) Protein pocket coordinates
+            threshold: Distance in Angstroms (default 1.5A is a standard VDW clash limit)
+        """
+        # Compute pairwise distances (N x M)
+        dists = torch.cdist(z_t_pos, pocket_pos)
 
-    def sample_zs_from_zt(self, z_t, s_int, test = False):
+        # Identify clashes
+        clash_mask = dists < threshold
+        if not clash_mask.any():
+            return torch.zeros_like(z_t_pos)  # No clashes, no gradient
+        
+        # Calculate repulsion energy
+        energy = torch.sum((threshold - dists[clash_mask]) ** 2)
+
+        # Calculate gradient
+        grads = torch.autograd.grad(energy, z_t_pos)[0]
+
+        return grads
+    
+    def sample_zs_from_zt(self, z_t, s_int, test = False, sample_condition=None, guidance_scale=0.0):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
            if last_step, return the graph prediction as well"""
         # t = s_int[0, 0].item()
@@ -562,6 +599,46 @@ class FullDenoisingDiffusion(pl.LightningModule):
         # else:
         pred = self.forward(z_t, extra_data)
         z_s = self.noise_model.sample_zs_from_zt_and_pred(z_t=z_t, pred=pred, s_int=s_int)
+
+        if (self.affinity_model is not None and 
+            sample_condition is not None and 
+            hasattr(sample_condition, 'pocket_pos') and 
+            guidance_scale > 0):
+            
+            current_t = s_int[0].item()
+
+            # Heuristic: 
+            # - T=1000 (Pure Noise): No guidance (let it explore)
+            # - T=500  (Formation): Peak guidance (shape the molecule)
+            # - T=0    (Finalizing): No guidance (preserve precise bond lengths)
+            if current_t > 900 or current_t < 5:
+                effective_scale = 0.0
+            else:
+                effective_scale = guidance_scale
+
+            if effective_scale > 0:
+                z_t_pos = z_t.pos.detach().clone().requires_grad_(True)
+                predicted_affinity = self.affinity_model(
+                    lig_pos=z_t_pos,
+                    lig_feat=z_t.X, # Atom types
+                    prot_pos=sample_condition.pocket_pos,
+                    prot_feat=sample_condition.pocket_feat,
+                    t=s_int
+                )
+
+                grad_affinity = torch.autograd.grad(predicted_affinity.sum(), z_t_pos)[0]
+
+                clash_scale = guidance_scale * 2.0
+                grad_clash = self.calculate_clash_gradient(
+                    z_t_pos,
+                    sample_condition.pocket_pos,
+                    threshold=1.5
+                )
+                total_grad = (effective_scale * grad_affinity) - (clash_scale * grad_clash)
+                total_grad = torch.clamp(total_grad, -1.0, 1.0)  
+                
+                z_s.pos = z_s.pos + total_grad
+
         return z_s
 
     def sample_n_graphs(self, data, samples_to_generate: int, chains_to_save: int, samples_to_save: int, test: bool, sample_condition: None):
