@@ -9,7 +9,12 @@ def train_affinity_predictor():
     # 1. Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dataset = PlinderGraphDataset(split='train')
-    loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=dataset.collate)
+
+    affinities = dataset.index['affinity_data.pKd'].values
+    weights = torch.tensor([5.0 if a > 7.0 else 1.0 for a in affinities], dtype=torch.float)
+    sampler = WeightedRandomSampler(weights, num_sampler=len(weights), replacement=True)
+    
+    loader = torch.utils.data.DataLoader(dataset, batch_size=32, sampler=sampler, collate_fn=dataset.collate)
     
     # 2. Models
     model = TimeAwareAffinityPredictor().to(device)
@@ -71,12 +76,6 @@ def train_affinity_predictor():
         
         # Save Checkpoint
         torch.save(model.state_dict(), "affinity_compass.pt")
-
-def get_stratified_loader(dataset, batch_size):
-    affinities = dataset.index['affinity_data.pKd'].values
-    weights = np.where(affinities > 7.0, 5.0, 1.0) # 5x weight for high affinity
-    sampler = WeightedRandomSampler(weights, len(weights))
-    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=dataset.collate)
 
 if __name__ == "__main__":
     train_affinity_predictor()
