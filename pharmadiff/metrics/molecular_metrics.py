@@ -298,13 +298,16 @@ class SamplingMetrics(nn.Module):
                                                            atom_decoder=self.dataset_infos.atom_decoder,
                                                            save_histogram=self.test)
         self.angles_w1(angles_w1)
+        valence_scores = [m.valence_valid for m in molecules]
+        avg_valence = sum(valence_scores) / len(valence_scores) if valence_scores else 0
         to_log = {'sampling/NumNodesW1': self.num_nodes_w1.compute(),
                   'sampling/AtomTypesTV': self.atom_types_tv.compute(),
                   'sampling/EdgeTypesTV': self.edge_types_tv.compute(),
                   'sampling/ChargeW1': self.charge_w1.compute(),
                   'sampling/ValencyW1': self.valency_w1.compute(),
                   'sampling/BondLengthsW1': self.bond_lengths_w1.compute(),
-                  'sampling/AnglesW1': self.angles_w1.compute()}
+                  'sampling/AnglesW1': self.angles_w1.compute(),
+                  'sampling/valence_validity": avg_valence}
         if local_rank == 0:
             print(f"Sampling metrics", {key: round(val.item(), 3) for key, val in to_log.items()})
 
