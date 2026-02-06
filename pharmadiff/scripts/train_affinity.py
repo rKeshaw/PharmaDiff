@@ -1,5 +1,6 @@
 import torch
 import torch.optim as optim
+from torch.utils.data import WeightedRandomSampler
 from pharmadiff.datasets.plinder_dataset import PlinderGraphDataset
 from pharmadiff.models.affinity_predictor import TimeAwareAffinityPredictor
 from pharmadiff.diffusion.noise_model import NoiseModel # Existing PharmaDiff Code
@@ -70,6 +71,12 @@ def train_affinity_predictor():
         
         # Save Checkpoint
         torch.save(model.state_dict(), "affinity_compass.pt")
+
+def get_stratified_loader(dataset, batch_size):
+    affinities = dataset.index['affinity_data.pKd'].values
+    weights = np.where(affinities > 7.0, 5.0, 1.0) # 5x weight for high affinity
+    sampler = WeightedRandomSampler(weights, len(weights))
+    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=dataset.collate)
 
 if __name__ == "__main__":
     train_affinity_predictor()
