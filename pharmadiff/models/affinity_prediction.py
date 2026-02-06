@@ -4,7 +4,7 @@ from torch_geometric.nn import EGNNConv
 import math
 
 class TimeAwareAffinityPredictor(nn.Module):
-    def __init__(self, ligand_in_dim=15, protein_in_dim=5, hidden_dim=64):
+    def __init__(self, ligand_in_dim=15, protein_in_dim=8, hidden_dim=64):
         super().__init__()
         
         # 1. Feature Embeddings
