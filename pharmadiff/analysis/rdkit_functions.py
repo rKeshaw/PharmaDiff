@@ -88,7 +88,8 @@ class Molecule:
         self.bond_types = bond_types.long()
         self.positions = positions
         self.charges = charges
-        self.rdkit_mol = self.build_molecule(atom_decoder)            
+        self.rdkit_mol = self.build_molecule(atom_decoder)
+        self.valence_valid = True
         self.num_nodes = len(atom_types)
         self.num_atom_types = len(atom_decoder)
         self.pharma_coord = pharma_coord
