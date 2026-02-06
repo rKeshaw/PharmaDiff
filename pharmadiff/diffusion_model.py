@@ -565,31 +565,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
         _ = visualizer.visualize(result_path, molecule_list, num_molecules_to_visualize=save_final)
         self.print("Visualizing done.")
         return molecule_list
-    
-    def calculate_clash_gradient(self, z_t_pos, pocket_pos, threshold=1.5):
-        """
-        Calculates a repulsive force if ligand atoms get too close to protein atoms.
-        
-        Args:
-            z_t_pos: (N, 3) Ligand coordinates (Requires Grad)
-            pocket_pos: (M, 3) Protein pocket coordinates
-            threshold: Distance in Angstroms (default 1.5A is a standard VDW clash limit)
-        """
-        # Compute pairwise distances (N x M)
-        dists = torch.cdist(z_t_pos, pocket_pos)
-
-        # Identify clashes
-        clash_mask = dists < threshold
-        if not clash_mask.any():
-            return torch.zeros_like(z_t_pos)  # No clashes, no gradient
-        
-        # Calculate repulsion energy
-        energy = torch.sum((threshold - dists[clash_mask]) ** 2)
-
-        # Calculate gradient
-        grads = torch.autograd.grad(energy, z_t_pos)[0]
-
-        return grads
 
     def calculate_physics_gradient(self, z_t_pos, pocket_pos, eps=0.1, sigma=2.0):
         """
