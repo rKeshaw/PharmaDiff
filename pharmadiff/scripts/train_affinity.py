@@ -31,6 +31,8 @@ def train_affinity_predictor():
             prot_pos = batch['pocket_pos'].to(device)
             prot_feat = batch['pocket_feat'].to(device)
             true_affinity = batch['affinity'].to(device)
+            lig_batch_idx = batch['ligand'].batch.to(device)
+            prot_batch_idx = batch['pocket_batch'].to(device)
             
             # B. Sample Timesteps (t)
             batch_size = batch['ligand'].num_graphs
@@ -53,7 +55,7 @@ def train_affinity_predictor():
             lig_pos_noisy = (sqrt_alpha * lig_feat) + (sqrt_one_minus_alpha * uniform_dist)
             
             # D. Predict Affinity from NOISY structure
-            pred_affinity = model(lig_pos_noisy, lig_feat_noisy, prot_pos, prot_feat, t)
+            pred_affinity = model(lig_pos_noisy, lig_feat_noisy, prot_pos, prot_feat, t, lig_batch_idx, prot_batch_idx)
             
             # E. Loss
             # We want the model to predict the TRUE affinity even from noisy structures
