@@ -61,9 +61,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.input_dims = self.extra_features.update_input_dims(dataset_infos.input_dims)
         self.output_dims = dataset_infos.output_dims
         # self.domain_features = ExtraMolecularFeatures(dataset_infos=dataset_infos)
-        self.affinity_model = AffinityPredictor(
+        self.affinity_model = TimeAwareAffinityPredictor(
             ligand_in_dim=dataset_infos.input_dims.X, 
-            protein_in_dim=5 # Based on simple C,N,O,S,Other encoding
+            protein_in_dim=8 # Pocket features from PLINDER encoder
         )
 
         # Train metrics
