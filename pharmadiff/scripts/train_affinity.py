@@ -1,9 +1,14 @@
+from pathlib import Path
+
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
+from hydra import compose, initialize_config_dir
 from torch.utils.data import WeightedRandomSampler
+
 from pharmadiff.datasets.plinder_dataset import PlinderGraphDataset
+from pharmadiff.diffusion.noise_model import NoiseModel
 from pharmadiff.models.affinity_predictor import TimeAwareAffinityPredictor
-from pharmadiff.diffusion.noise_model import NoiseModel # Existing PharmaDiff Code
 
 def train_affinity_predictor():
     # 1. Setup
@@ -12,14 +17,17 @@ def train_affinity_predictor():
 
     affinities = dataset.index['affinity_data.pKd'].values
     weights = torch.tensor([5.0 if a > 7.0 else 1.0 for a in affinities], dtype=torch.float)
-    sampler = WeightedRandomSampler(weights, num_sampler=len(weights), replacement=True)
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     
     loader = torch.utils.data.DataLoader(dataset, batch_size=32, sampler=sampler, collate_fn=dataset.collate)
     
     # 2. Models
     model = TimeAwareAffinityPredictor().to(device)
     # We need the noise scheduler to generate training samples
-    noise_scheduler = NoiseModel() # Load default schedule
+    config_dir = Path(__file__).resolve().parents[2] / "configs"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name="config", overrides=["dataset=plinder"])
+    noise_scheduler = NoiseModel(cfg)
     
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     loss_fn = torch.nn.MSELoss()
@@ -42,26 +50,31 @@ def train_affinity_predictor():
             
             # B. Sample Timesteps (t)
             batch_size = batch['ligand'].num_graphs
-            t = torch.randint(0, 1000, (batch_size,), device=device).long()
+            t = torch.randint(0, noise_scheduler.T, (batch_size,), device=device).long()
             
             # C. Add Noise (The Critical Step)
             # We corrupt the clean ligand positions to simulate diffusion steps
             noise = torch.randn_like(lig_pos_clean)
-            alpha_bars = noise_scheduler.get_alphas_bars(t) # You'll need to expose this from NoiseModel
-            
-            # x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * eps
-            sqrt_alpha = torch.sqrt(alpha_bars)
-            sqrt_one_minus_alpha = torch.sqrt(1 - alpha_bars)
+            alpha_bars = noise_scheduler.get_alpha_bar(t_int=t, key='p')
+            sqrt_alpha = torch.sqrt(alpha_bars).clamp(min=1e-6)
+            sqrt_one_minus_alpha = torch.sqrt(1 - alpha_bars).clamp(min=1e-6)
+            node_alpha = sqrt_alpha[lig_batch_idx].unsqueeze(-1)
+            node_sigma = sqrt_one_minus_alpha[lig_batch_idx].unsqueeze(-1)
+            lig_pos_noisy = node_alpha * lig_pos_clean + node_sigma * noise
 
-            num_types = lig_feat.shape[-1]
-            uniform_dist = torch.ones_like(lig_feat) / num_types
-            
-            # Broadcast scalar t factors to node dimensions
-            # (assuming simple batching for brevity - use torch_geometric Batch in production)
-            lig_pos_noisy = (sqrt_alpha * lig_feat) + (sqrt_one_minus_alpha * uniform_dist)
+            num_types = model.lig_emb.in_features
+            lig_feat_one_hot = F.one_hot(lig_feat, num_classes=num_types).float()
             
             # D. Predict Affinity from NOISY structure
-            pred_affinity = model(lig_pos_noisy, lig_feat_noisy, prot_pos, prot_feat, t, lig_batch_idx, prot_batch_idx)
+            pred_affinity = model(
+                lig_pos_noisy,
+                lig_feat_one_hot,
+                prot_pos,
+                prot_feat,
+                t,
+                lig_batch=lig_batch_idx,
+                prot_batch=prot_batch_idx,
+            )
             
             # E. Loss
             # We want the model to predict the TRUE affinity even from noisy structures
