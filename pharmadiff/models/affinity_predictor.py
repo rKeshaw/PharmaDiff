@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import EGNNConv
 import math
+from typing import Optional, Tuple
 
 class TimeAwareAffinityPredictor(nn.Module):
     def __init__(self, ligand_in_dim=15, protein_in_dim=8, hidden_dim=64):
@@ -39,23 +40,65 @@ class TimeAwareAffinityPredictor(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
-    def forward(self, lig_pos, lig_feat, prot_pos, prot_feat, t):
+    def _prepare_inputs(
+        self,
+        pos: torch.Tensor,
+        feat: torch.Tensor,
+        batch_idx: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if pos.dim() == 3:
+            if mask is None:
+                raise ValueError("mask is required for dense (B, N, ...) inputs.")
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            batch_size, num_nodes = mask.shape
+            batch_idx = torch.arange(batch_size, device=pos.device).repeat_interleave(num_nodes)
+            pos = pos.reshape(-1, pos.size(-1))
+            feat = feat.reshape(-1, feat.size(-1))
+            mask_flat = mask.reshape(-1)
+            pos = pos[mask_flat]
+            feat = feat[mask_flat]
+            batch_idx = batch_idx[mask_flat]
+        else:
+            if batch_idx is None:
+                batch_idx = torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
+        return pos, feat, batch_idx
+
+    def forward(
+        self,
+        lig_pos: torch.Tensor,
+        lig_feat: torch.Tensor,
+        prot_pos: torch.Tensor,
+        prot_feat: torch.Tensor,
+        t: torch.Tensor,
+        lig_batch: Optional[torch.Tensor] = None,
+        prot_batch: Optional[torch.Tensor] = None,
+        lig_mask: Optional[torch.Tensor] = None,
+        prot_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Args:
             t: (Batch_Size, ) tensor of time steps
         """
+        lig_pos, lig_feat, lig_batch = self._prepare_inputs(
+            lig_pos, lig_feat, batch_idx=lig_batch, mask=lig_mask
+        )
+        prot_pos, prot_feat, prot_batch = self._prepare_inputs(
+            prot_pos, prot_feat, batch_idx=prot_batch, mask=prot_mask
+        )
+
+        if t.dim() == 0:
+            num_graphs = int(lig_batch.max().item()) + 1 if lig_batch.numel() > 0 else 1
+            t = t.expand(num_graphs)
+
         # Embed Time
         t_emb = self._get_time_embedding(t, 64) # Assuming hidden_dim=64
         t_emb = self.time_mlp(t_emb)
         
         # Combine Graphs (Ligand + Protein)
-        # Handle Batching
-        if lig_batch is None: # Fallback for Batch Size 1
-            lig_batch = torch.zeros(lig_pos.shape[0], dtype=torch.long, device=lig_pos.device)
-        if prot_batch is None:
-            prot_batch = torch.zeros(prot_pos.shape[0], dtype=torch.long, device=prot_pos.device)
-            
-        x_lig = self.lig_emb(lig_feat) + t_emb # Inject time into features
+        t_node = t_emb[lig_batch]  # Inject per-graph time into ligand nodes
+        x_lig = self.lig_emb(lig_feat) + t_node
         x_prot = self.prot_emb(prot_feat) # Protein is clean, no time needed (or add it too)
         
         x = torch.cat([x_lig, x_prot], dim=0)
