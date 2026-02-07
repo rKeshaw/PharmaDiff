@@ -64,6 +64,29 @@ Run:
 
 ``` python3 main.py dataset=geom dataset.remove_h=True +experiment=geom_no_h_adaptive general.test_only='path_to checkpoint' ```
 
+### Evaluation scripts & metric entry points
+- `pharmadiff/metrics/molecular_metrics.py`: sampling-time evaluation metrics (validity, pharmacophore match, pocket constraints).  
+- `pharmadiff/analysis/baselines_evaluation.py`: baseline comparisons with the sampling metrics.  
+- `pharmadiff/scripts/evaluate_docking.py`: docking/Vina-based evaluation helper.  
+
+### Pocket-constraint metrics (Plinder)
+The pocket metrics are computed when Plinder pockets are available in the batch (from `PlinderGraphDataset`):
+
+1. **Contact map satisfaction**  
+   - Build a reference contact map by checking which pocket atoms are within a cutoff (default 4.5 Å) of the *reference* ligand atoms.  
+   - Build a generated contact map with the same pocket.  
+   - Report the fraction of reference contacts that are satisfied by the generated ligand.
+
+2. **Interaction fingerprint similarity**  
+   - Construct a binary interaction fingerprint that encodes ligand atom-type ↔ pocket atom-type contacts at the same cutoff.  
+   - Compute a Tanimoto similarity between the reference fingerprint and the generated fingerprint.
+
+Plinder provides the necessary inputs:
+- **Reference ligand**: `data['ligand'].pos` (coordinates) and `data['ligand'].x` (atom types).  
+- **Pocket**: `data['pocket_pos']` and `data['pocket_feat']` from `PlinderGraphDataset`/`collate`.  
+
+When running evaluation (`main.py ... general.test_only=...`) with Plinder data, the reference ligand/pocket are propagated into the sampling metrics and logged in the output as:
+`Pocket contact satisfaction` and `Pocket interaction fingerprint similarity`.
 
 ## Checkpoints
 
