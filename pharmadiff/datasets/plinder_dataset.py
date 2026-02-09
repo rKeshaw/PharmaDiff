@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Any, Iterable, Optional
 
@@ -6,6 +7,8 @@ from typing import Any, Iterable, Optional
 # =============================================================================
 os.environ["PLINDER_RELEASE"] = "2024-06"
 os.environ["PLINDER_ITERATION"] = "v2"
+
+logging.getLogger("plinder").setLevel(logging.WARNING)
 
 import numpy as np
 import torch
@@ -21,7 +24,7 @@ from pharmadiff.datasets.dataset_utils import mol_to_torch_geometric
 from pharmadiff.datasets.pharmacophore_utils import mol_to_torch_pharmacophore
 
 # Atom encoding for PharmaDiff (Must match your model config)
-ATOM_ENCODER = {'H': 0, 'B': 1, 'C': 2, 'N': 3, 'O': 4, 'F': 5, 'P': 8, 'S': 9, 'Cl': 10, 'Br': 12, 'I': 13}
+ATOM_ENCODER = {'H': 0, 'B': 1, 'C': 2, 'N': 3, 'O': 4, 'F': 5, 'P': 6, 'S': 7, 'Cl': 8, 'Br': 9, 'I': 10, 'Fe': 11}
 
 _HYDROPHOBIC_RES = {'ALA', 'VAL', 'LEU', 'ILE', 'MET', 'PHE', 'TRP', 'PRO'}
 
@@ -40,7 +43,13 @@ class PlinderGraphDataset(Dataset):
         affinity: (1,) binding affinity label (pKd).
     """
 
-    def __init__(self, split: str = 'train', pocket_radius: float = 10.0, transform=None):
+    def __init__(
+        self,
+        split: str = 'train',
+        pocket_radius: float = 10.0,
+        transform=None,
+        debug: bool = False,
+    ):
         """
         Args:
             split (str): 'train', 'val', or 'test'
@@ -50,6 +59,7 @@ class PlinderGraphDataset(Dataset):
         self.split = split
         self.pocket_radius = pocket_radius
         self.transform = transform
+        self.debug = debug
 
         print(f"--> Loading PLINDER index for split: {split}")
         # Load full index with all columns to ensure we get affinity data
@@ -72,75 +82,96 @@ class PlinderGraphDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, idx):
-        # 1. Retrieve System ID
         entry = self.index.iloc[idx]
         system_id = entry.get('system_id', entry.get('id'))
 
         try:
-            # 2. Load System (Triggers download if not cached)
+            from Bio.PDB import PDBParser
+            
             ps = PlinderSystem(system_id=system_id)
-
-            # 3. Access Components via the .system property 
-            system_obj = ps.system
             
-            if system_obj is None:
-                return None
-
-            # Ligands: ps.system.ligands is a list of ligand objects
-            ligand_list = system_obj.ligands
-            if not ligand_list:
+            # Load ligand from SDF
+            ligand_sdfs = ps.ligand_sdfs
+            if not ligand_sdfs:
+                if self.debug:
+                    print(f"[PlinderGraphDataset] No ligand SDF files for {system_id}")
                 return None
             
-            # Grab the first ligand's RDKit molecule 
-            ligand_mol = ligand_list[0].rdkit_mol
-
-            # Receptor: ps.system.receptor is the receptor object
-            receptor_struct = system_obj.receptor.structure
-
-            if ligand_mol is None or receptor_struct is None:
+            first_ligand_id = list(ligand_sdfs.keys())[0]
+            ligand_sdf_path = ligand_sdfs[first_ligand_id]
+            
+            supplier = Chem.SDMolSupplier(ligand_sdf_path, removeHs=False)
+            ligand_mol = supplier[0]
+            
+            if ligand_mol is None:
+                if self.debug:
+                    print(f"[PlinderGraphDataset] Failed to load ligand from {ligand_sdf_path}")
                 return None
-
-            # 4. Compute Pharmacophore (PharmaDiff Logic)
+            
+            # Load receptor with BioPython
+            receptor_path = ps.receptor_pdb
+            parser = PDBParser(QUIET=True)
+            structure = parser.get_structure('receptor', receptor_path)
+            
+            # Extract receptor data
+            rec_coords = []
+            rec_elements = []
+            rec_res_names = []
+            rec_res_ids = []
+            rec_atom_ids = []
+            rec_chain_ids = []
+            
+            for model in structure:
+                for chain in model:
+                    for residue in chain:
+                        for atom in residue:
+                            rec_coords.append(atom.coord)
+                            rec_elements.append(atom.element)
+                            rec_res_names.append(residue.resname)
+                            rec_res_ids.append(residue.id[1])
+                            rec_atom_ids.append(atom.serial_number)
+                            rec_chain_ids.append(chain.id)
+            
+            rec_coords = np.array(rec_coords)
+            rec_elements = np.array(rec_elements)
+            rec_res_names = np.array(rec_res_names)
+            rec_res_ids = np.array(rec_res_ids, dtype=np.int64)
+            rec_atom_ids = np.array(rec_atom_ids, dtype=np.int64)
+            rec_chain_ids = np.array(rec_chain_ids)
+            
+            # Pharmacophore
             lig_pos = ligand_mol.GetConformer().GetPositions()
             pos_mean = torch.tensor(lig_pos, dtype=torch.float32).mean(dim=0)
-            pharma_data = mol_to_torch_pharmacophore(ligand_mol, pos_mean)
-            if pharma_data is None: return None
+            pharma_data = mol_to_torch_pharmacophore(ligand_mol, pos_mean, name='geom')
+            
+            if pharma_data is None:
+                if self.debug:
+                    print(f"[PlinderGraphDataset] Failed pharmacophore for {system_id}")
+                return None
 
-            # 5. Convert Ligand to Graph
             ligand_data, _ = mol_to_torch_geometric(
                 ligand_mol, 
                 ATOM_ENCODER, 
                 smiles=Chem.MolToSmiles(ligand_mol)
             )
 
-            # 6. Extract Pocket (Context)
-            # Calculate centroid of the ligand
-            ligand_coords = np.asarray(ligand_mol.GetConformer().GetPositions())
+            # Pocket extraction
+            ligand_coords = np.asarray(lig_pos)
             lig_centroid = ligand_coords.mean(axis=0)
-            
-            # Get receptor coordinates and filter by radius
-            rec_coords = np.asarray(receptor_struct.coord)
             dists = np.linalg.norm(rec_coords - lig_centroid, axis=1)
             pocket_mask = dists < self.pocket_radius
 
-            # Create tensors for pocket
             pocket_coords = torch.tensor(rec_coords[pocket_mask], dtype=torch.float32)
-            pocket_atoms = self._slice_array(receptor_struct, "element", pocket_mask)
-            residue_names = self._slice_array(receptor_struct, ("res_name", "residue_name", "resname"),
-                                              pocket_mask, default_value="UNK")
-            residue_ids = self._slice_array(receptor_struct, ("res_id", "residue_id", "resid"),
-                                            pocket_mask, default_value=-1)
-            atom_ids = self._slice_array(receptor_struct, ("atom_id", "atom_index", "atom_serial"),
-                                         pocket_mask, default_value=np.arange(len(rec_coords)))
-            chain_ids = self._slice_array(receptor_struct, ("chain_id", "chain"),
-                                          pocket_mask, default_value="")
+            pocket_atoms = rec_elements[pocket_mask]
+            residue_names = rec_res_names[pocket_mask]
+            residue_ids = rec_res_ids[pocket_mask]
+            atom_ids = rec_atom_ids[pocket_mask]
+            chain_ids = rec_chain_ids[pocket_mask]
 
             pocket_min_dist = self._min_dist_to_ligand(rec_coords[pocket_mask], ligand_coords)
             pocket_feats = self._encode_protein_atoms(pocket_atoms, residue_names, pocket_min_dist)
 
-            # 8. Get Affinity Label
-            # Ensure we cast to float32 for torch compatibility
-            affinity_val = entry['affinity_data.pKd']
+            affinity_val = entry.get('affinity_data.pKd', 0)
             affinity = torch.tensor([affinity_val], dtype=torch.float32)
 
             return {
@@ -148,17 +179,19 @@ class PlinderGraphDataset(Dataset):
                 'pharmacophore': pharma_data,
                 'pocket_pos': pocket_coords,
                 'pocket_feat': pocket_feats,
-                'pocket_residue_index': torch.tensor(self._coerce_indices(residue_ids), dtype=torch.long),
-                'pocket_atom_index': torch.tensor(self._coerce_indices(atom_ids), dtype=torch.long),
+                'pocket_residue_index': torch.tensor(residue_ids, dtype=torch.long),
+                'pocket_atom_index': torch.tensor(atom_ids, dtype=torch.long),
                 'pocket_residue_name': list(residue_names),
                 'pocket_chain_id': list(chain_ids),
                 'system_id': system_id,
                 'affinity': affinity
             }
 
-        except Exception:
+        except Exception as exc:
+            if self.debug:
+                print(f"[PlinderGraphDataset] Error for {system_id}: {exc}")
             return None
-
+        
     def collate(self, data_list):
         """
         Custom collate to handle variable-sized pockets and PyG Batching

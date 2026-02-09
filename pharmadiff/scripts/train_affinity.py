@@ -1,23 +1,50 @@
+import argparse
 from pathlib import Path
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from hydra import compose, initialize_config_dir
 from torch.utils.data import WeightedRandomSampler
 from pharmadiff.datasets.plinder_dataset import PlinderGraphDataset
+from pharmadiff.datasets.plinder_precomputed_dataset import PlinderPrecomputedDataset
 from pharmadiff.diffusion.noise_model import NoiseModel
 from pharmadiff.models.affinity_predictor import TimeAwareAffinityPredictor
 
-def train_affinity_predictor():
+def train_affinity_predictor(
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    use_precomputed: bool,
+    precomputed_root: str,
+):
     # 1. Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset = PlinderGraphDataset(split='train')
+    if use_precomputed:
+        dataset = PlinderPrecomputedDataset(split="train", root=precomputed_root)
+    else:
+        dataset = PlinderGraphDataset(split='train')
 
-    affinities = dataset.index['affinity_data.pKd'].values
-    weights = torch.tensor([5.0 if a > 7.0 else 1.0 for a in affinities], dtype=torch.float)
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    # affinities = dataset.index['affinity_data.pKd'].values
+    if use_precomputed:
+        sampler = None
+    else:
+        affinities = dataset.index['affinity_data.pKd'].values
+        weights = torch.tensor([5.0 if a > 7.0 else 1.0 for a in affinities], dtype=torch.float)
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     
-    loader = torch.utils.data.DataLoader(dataset, batch_size=32, sampler=sampler, collate_fn=dataset.collate)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        collate_fn=dataset.collate,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
     
     # 2. Models
     model = TimeAwareAffinityPredictor().to(device)
@@ -32,9 +59,12 @@ def train_affinity_predictor():
 
     # 3. Training Loop
     model.train()
-    for epoch in range(100):
+    for epoch in range(epochs):
         total_loss = 0
         for batch in loader:
+            if batch is None:
+                print("Warning: Received None batch, skipping...")
+                continue
             optimizer.zero_grad()
             
             # A. Prepare Data
@@ -42,7 +72,7 @@ def train_affinity_predictor():
             lig_feat = batch['ligand'].x.to(device)
             prot_pos = batch['pocket_pos'].to(device)
             prot_feat = batch['pocket_feat'].to(device)
-            true_affinity = batch['affinity'].to(device)
+            true_affinity = batch['affinity'].to(device).view(-1, 1)
             lig_batch_idx = batch['ligand'].batch.to(device)
             prot_batch_idx = batch['pocket_batch'].to(device)
             
@@ -89,4 +119,19 @@ def train_affinity_predictor():
         torch.save(model.state_dict(), "affinity_compass.pt")
 
 if __name__ == "__main__":
-    train_affinity_predictor()
+    parser = argparse.ArgumentParser(description="Train affinity predictor on PLINDER.")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--use-precomputed", action="store_true")
+    parser.add_argument("--precomputed-root", default="data/plinder_precomputed")
+    args = parser.parse_args()
+    train_affinity_predictor(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        use_precomputed=args.use_precomputed,
+        precomputed_root=args.precomputed_root,
+    )

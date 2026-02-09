@@ -19,7 +19,7 @@ class ConditioningFusion(nn.Module):
         super().__init__()
         self.cond_dim = cond_dim
         self.fusion_type = fusion_type
-        self.pocket_proj = nn.LazyLinear(cond_dim)
+        self.pocket_proj = nn.Linear(8, cond_dim)
         if fusion_type == "concat":
             self.fuse_proj = nn.Linear(cond_dim * 2, cond_dim)
         elif fusion_type == "gated":

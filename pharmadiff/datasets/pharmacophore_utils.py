@@ -11,9 +11,6 @@ import torch
 from torch_geometric.data import Data
 import torch.nn.functional as F
 
-
-
-
 PHARMACOPHORE_FAMILES_TO_KEEP= ('Aromatic', 'Hydrophobe', 'PosIonizable', 'Acceptor', 'Donor', 
                                  'LumpedHydrophobe')
 FAMILY_MAPPING = {'Aromatic': 1, 'Hydrophobe': 2, 'PosIonizable': 3, 'Acceptor': 4, 'Donor': 5, 'LumpedHydrophobe': 6}
@@ -35,11 +32,6 @@ def sample_probability(elment_array, plist, N):
         Psample.append(elment_array[index])
 
     return Psample
-
-
-
-
-
 
 def get_features_factory(features_names, resetPharmacophoreFactory=False):
     global _FEATURES_FACTORY, _FEATURES_NAMES
@@ -87,14 +79,9 @@ def getPharamacophoreCoords(mol, features_names: Iterable[str] = PHARMACOPHORE_F
             feat_arr = np.append(feat_arr, np.array(FAMILY_MAPPING[f.GetFamily()]))
             coord_arr= np.append(coord_arr, np.array(f.GetPos(confId=f.GetActiveConformer())))
             idx_arr_list.append(idx_arr)
-            
-            
-
-        
+                
     coord_arr = coord_arr.reshape(-1, 3)
     #overlap_atoms = hydrophobes & lumped_hydrophobes_and_arom 
-    
-
     
     permuted_indices = np.random.permutation(range(len(feat_arr))).astype(int)
     feat_arr = feat_arr[permuted_indices] 
@@ -122,25 +109,8 @@ def getPharamacophoreCoords(mol, features_names: Iterable[str] = PHARMACOPHORE_F
     
     assert len(new_feat_arr) == len(new_idx_arr_list) == len(new_coord_arr), \
     f"Length mismatch: feat_arr({len(new_feat_arr)}), idx_arr_list({len(new_idx_arr_list)}), coord_arr({len(new_coord_arr)})"
-
-
-
-    # _, unique_indices = np.unique(new_coord_arr, return_index=True, axis=0)
-    # unique_indices = unique_indices.astype(int)
-    # new_feat_arr = feat_arr[unique_indices] 
-    # new_idx_arr_list = [new_idx_arr_list[i] for i in unique_indices]
-    # new_coord_arr = new_coord_arr[unique_indices]
-    
-    
-    # _, unique_indices = np.unique(idx_arr, return_index=True, axis=0)
-    # unique_indices = unique_indices.astype(int)
-    # feat_arr = feat_arr[unique_indices] 
-    # idx_arr = idx_arr[unique_indices]
-    # coord_arr = coord_arr[unique_indices]
             
     return new_feat_arr, new_idx_arr_list, new_coord_arr
-
-
 
 def pharmacophore_to_torch(feat_arr, idx_arr_list, coord_arr, pos_mean, mol, name):
     
@@ -215,8 +185,6 @@ def mol_to_torch_pharmacophore_mol_metrics(mol):
     feat_arr, idx_arr, coord_arr=  pharmacophore_to_torch_mol_metrics(feat_arr, idx_arr, coord_arr)
     return feat_arr, idx_arr, coord_arr
 
-
-
 def pharmacophore_to_torch_mol_metrics(feat_list, idx_list, coord_list,):
             
     feat_arr = np.empty(0)
@@ -239,10 +207,6 @@ def load_phar_file(file_path):
         raise ValueError(f'Invalid file path: "{file_path}"!')
 
     return load_file_fn(file_path)
-
-
-
-
 
 def load_pp_file(file_path):
     node_type = []
@@ -276,8 +240,6 @@ def load_ep_file(file_path):
    ## to be implemented
     return None
 
-
-
 def prepare_pharma_data(sample_condition, n_nodes, bs, name, remove_hydrogens=True):
     node_type, node_pos = load_phar_file(sample_condition)
     
@@ -289,12 +251,9 @@ def prepare_pharma_data(sample_condition, n_nodes, bs, name, remove_hydrogens=Tr
         atom_encoder =  {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4}
     elif name == 'geom':
         atom_encoder = {'H': 0, 'B': 1, 'C': 2, 'N': 3, 'O': 4, 'F': 5, 'Al': 6, 'Si': 7,
-                        'P': 8, 'S': 9, 'Cl': 10, 'As': 11, 'Br': 12, 'I': 13, 'Hg': 14, 'Bi': 15}
-
-        
+                        'P': 8, 'S': 9, 'Cl': 10, 'As': 11, 'Br': 12, 'I': 13, 'Hg': 14, 'Bi': 15} 
         
     n = len(node_type)
-    
     
     feat_array = np.empty(0)
     coord_array = np.empty(0)
@@ -328,23 +287,9 @@ def prepare_pharma_data(sample_condition, n_nodes, bs, name, remove_hydrogens=Tr
         
         elif node_type[i] == 1:
             print("Aromatic")
-            
-                
-        
-             
-                
-        
-        
-    
 
     # Generate n random integers less than min_nodes
     random_numbers = np.random.randint(0, min_nodes, size=n)
-    
-    
-    
-    
-    
-    
     
     feat_array = np.zeros(min_nodes)
     coord_array = np.zeros((min_nodes, 3))

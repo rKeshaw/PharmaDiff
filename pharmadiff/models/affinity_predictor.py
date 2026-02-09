@@ -1,8 +1,16 @@
 import torch
 import torch.nn as nn
-from torch_geometric.nn import EGNNConv
 import math
 from typing import Optional, Tuple
+from torch_geometric.nn import GraphConv
+
+class EGNNConv(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.conv = GraphConv(in_channels, out_channels)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, coord: torch.Tensor = None) -> torch.Tensor:
+        return self.conv(x, edge_index)
 
 class TimeAwareAffinityPredictor(nn.Module):
     def __init__(self, ligand_in_dim=15, protein_in_dim=8, hidden_dim=64):

@@ -13,8 +13,8 @@ general:
     final_model_samples_to_save: 0
     final_model_chains_to_save: 0
 train:
-    batch_size: 20
-    reference_batch_size: 4
+    batch_size: 128
+    reference_batch_size: 16
     save_model: False
 model:
     n_layers: 2

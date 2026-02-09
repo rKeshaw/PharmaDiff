@@ -65,7 +65,8 @@ def to_dense(data, dataset_info, device=None):
     max_num_nodes = X.size(1)
     edge_index, edge_attr = remove_self_loops(data['ligand'].edge_index , data['ligand'].edge_attr )
     E = to_dense_adj(edge_index=edge_index, batch=data['ligand'].batch, edge_attr=edge_attr, max_num_nodes=max_num_nodes)
-        
+    if E.numel() > 0:
+        E = torch.maximum(E, E.transpose(1, 2))
     X, charges, E = dataset_info.to_one_hot(X, charges=charges, E=E, node_mask=node_mask)
 
 
@@ -97,6 +98,18 @@ def to_dense(data, dataset_info, device=None):
     pocket_pos = data.get('pocket_pos') if isinstance(data, dict) else None
     pocket_feat = data.get('pocket_feat') if isinstance(data, dict) else None
     pocket_batch = data.get('pocket_batch') if isinstance(data, dict) else None
+    pocket_mask = None
+    if pocket_pos is not None and pocket_batch is not None:
+        if pocket_pos.numel() == 0:
+            pocket_pos = None
+            pocket_feat = None
+            pocket_mask = None
+            pocket_batch = None
+        else:
+            pocket_pos_dense, pocket_mask = to_dense_batch(x=pocket_pos, batch=pocket_batch)
+            pocket_pos = pocket_pos_dense
+            if pocket_feat is not None:
+                pocket_feat, _ = to_dense_batch(x=pocket_feat, batch=pocket_batch)
 
     if device is not None:
         X = X.to(device)
@@ -118,6 +131,8 @@ def to_dense(data, dataset_info, device=None):
             pocket_feat = pocket_feat.to(device)
         if pocket_batch is not None:
             pocket_batch = pocket_batch.to(device)
+        if pocket_mask is not None:
+            pocket_mask = pocket_mask.to(device)
 
     data = PlaceHolder(
         X=X[valid_rows],
@@ -136,6 +151,7 @@ def to_dense(data, dataset_info, device=None):
         pocket_pos=pocket_pos,
         pocket_feat=pocket_feat,
         pocket_batch=pocket_batch,
+        pocket_mask=pocket_mask,
     )
 
     return data.mask()
@@ -175,6 +191,7 @@ class PlaceHolder:
         pocket_pos=None,
         pocket_feat=None,
         pocket_batch=None,
+        pocket_mask=None,
         ref_ligand_pos=None,
         ref_ligand_atom_types=None,
     ):
@@ -196,6 +213,7 @@ class PlaceHolder:
         self.pocket_pos = pocket_pos
         self.pocket_feat = pocket_feat
         self.pocket_batch = pocket_batch
+        self.pocket_mask = pocket_mask
         self.ref_ligand_pos = ref_ligand_pos
         self.ref_ligand_atom_types = ref_ligand_atom_types
 
@@ -215,6 +233,7 @@ class PlaceHolder:
         self.pocket_pos = self.pocket_pos.to(x.device) if self.pocket_pos is not None else None
         self.pocket_feat = self.pocket_feat.to(x.device) if self.pocket_feat is not None else None
         self.pocket_batch = self.pocket_batch.to(x.device) if self.pocket_batch is not None else None
+        self.pocket_mask = self.pocket_mask.to(x.device) if self.pocket_mask is not None else None
         self.ref_ligand_pos = self.ref_ligand_pos.to(x.device) if self.ref_ligand_pos is not None else None
         self.ref_ligand_atom_types = (
             self.ref_ligand_atom_types.to(x.device) if self.ref_ligand_atom_types is not None else None

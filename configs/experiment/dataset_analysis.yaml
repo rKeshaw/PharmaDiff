@@ -3,6 +3,7 @@ general:
     name : 'dataset_analysis'
     wandb: online
 train:
-    batch_size: 1
+    batch_size: 128
+    num_workers: 32
 dataset:
     remove_h: False
