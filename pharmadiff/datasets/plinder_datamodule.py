@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pytorch_lightning import LightningDataModule
+from hydra.utils import get_original_cwd
+from hydra.core.hydra_config import HydraConfig
 
 from pharmadiff.datasets.plinder_dataset import PlinderGraphDataset, ATOM_ENCODER
 from pharmadiff.datasets.abstract_dataset import AbstractDatasetInfos
@@ -18,22 +20,80 @@ class PlinderDataModule(LightningDataModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        if HydraConfig.initialized():
+            self._original_cwd = get_original_cwd()
+        else:
+            # Allow use from non-Hydra entrypoints (e.g., precompute scripts).
+            self._original_cwd = str(Path.cwd())
+        self._sample_cache_dir = self._resolve_path(getattr(cfg.dataset, "sample_cache_dir", "data/plinder/sample_cache"))
+        self._statistics_cache_path = self._resolve_path(getattr(cfg.dataset, "statistics_cache_path", "data/plinder/statistics.pt"))
+        
         self.train_dataset = PlinderGraphDataset(
             split="train",
             pocket_radius=cfg.dataset.pocket_radius,
+            contact_cutoff=getattr(cfg.dataset, "contact_cutoff", 4.5),
+            min_pocket_atoms=getattr(cfg.dataset, "min_pocket_atoms", 1),
+            min_affinity=getattr(cfg.dataset, "min_affinity", None),
+            max_entry_resolution=getattr(cfg.dataset, "max_entry_resolution", None),
+            require_rdkit_ligand=getattr(cfg.dataset, "require_rdkit_ligand", False),
+            pocket_structure_mode=getattr(cfg.dataset, "pocket_structure_mode", "holo_only"),
+            apo_pred_swap_prob=getattr(cfg.dataset, "apo_pred_swap_prob", 0.0),
+            max_collision_score=getattr(cfg.dataset, "max_collision_score", None),
+            require_posebusters_connected=getattr(cfg.dataset, "require_posebusters_connected", False),
+            cluster_column=getattr(cfg.dataset, "cluster_column", None),
+            allowed_clusters=getattr(cfg.dataset, "allowed_clusters", None),
+            use_sample_cache=getattr(cfg.dataset, "use_sample_cache", False),
+            sample_cache_dir=self._sample_cache_dir,
+            sample_cache_version=getattr(cfg.dataset, "sample_cache_version", "v1"),
         )
         self.val_dataset = PlinderGraphDataset(
             split="val",
             pocket_radius=cfg.dataset.pocket_radius,
+            contact_cutoff=getattr(cfg.dataset, "contact_cutoff", 4.5),
+            min_pocket_atoms=getattr(cfg.dataset, "min_pocket_atoms", 1),
+            min_affinity=getattr(cfg.dataset, "min_affinity", None),
+            max_entry_resolution=getattr(cfg.dataset, "max_entry_resolution", None),
+            require_rdkit_ligand=getattr(cfg.dataset, "require_rdkit_ligand", False),
+            pocket_structure_mode=getattr(cfg.dataset, "pocket_structure_mode", "holo_only"),
+            apo_pred_swap_prob=getattr(cfg.dataset, "apo_pred_swap_prob", 0.0),
+            max_collision_score=getattr(cfg.dataset, "max_collision_score", None),
+            require_posebusters_connected=getattr(cfg.dataset, "require_posebusters_connected", False),
+            cluster_column=getattr(cfg.dataset, "cluster_column", None),
+            allowed_clusters=getattr(cfg.dataset, "allowed_clusters", None),
+            use_sample_cache=getattr(cfg.dataset, "use_sample_cache", False),
+            sample_cache_dir=self._sample_cache_dir,
+            sample_cache_version=getattr(cfg.dataset, "sample_cache_version", "v1"),
         )
         self.test_dataset = PlinderGraphDataset(
             split="test",
             pocket_radius=cfg.dataset.pocket_radius,
+            contact_cutoff=getattr(cfg.dataset, "contact_cutoff", 4.5),
+            min_pocket_atoms=getattr(cfg.dataset, "min_pocket_atoms", 1),
+            min_affinity=getattr(cfg.dataset, "min_affinity", None),
+            max_entry_resolution=getattr(cfg.dataset, "max_entry_resolution", None),
+            require_rdkit_ligand=getattr(cfg.dataset, "require_rdkit_ligand", False),
+            pocket_structure_mode=getattr(cfg.dataset, "pocket_structure_mode", "holo_only"),
+            apo_pred_swap_prob=getattr(cfg.dataset, "apo_pred_swap_prob", 0.0),
+            max_collision_score=getattr(cfg.dataset, "max_collision_score", None),
+            require_posebusters_connected=getattr(cfg.dataset, "require_posebusters_connected", False),
+            cluster_column=getattr(cfg.dataset, "cluster_column", None),
+            allowed_clusters=getattr(cfg.dataset, "allowed_clusters", None),
+            use_sample_cache=getattr(cfg.dataset, "use_sample_cache", False),
+            sample_cache_dir=self._sample_cache_dir,
+            sample_cache_version=getattr(cfg.dataset, "sample_cache_version", "v1"),
         )
         self.statistics = self._load_or_compute_statistics(self.train_dataset)
 
+    def _resolve_path(self, path: Optional[str]) -> Optional[str]:
+        if path is None:
+            return None
+        p = Path(path)
+        if p.is_absolute():
+            return str(p)
+        return str(Path(self._original_cwd) / p)
+
     def _load_or_compute_statistics(self, dataset: PlinderGraphDataset):
-        cache_path = getattr(self.cfg.dataset, "statistics_cache_path", None)
+        cache_path = self._statistics_cache_path
         force_recompute = getattr(self.cfg.dataset, "statistics_force_recompute", False)
         if cache_path and not force_recompute:
             cache_file = Path(cache_path)
@@ -54,12 +114,29 @@ class PlinderDataModule(LightningDataModule):
             random.shuffle(indices)
             indices = indices[:max_samples]
 
+        subset = torch.utils.data.Subset(dataset, indices)
+        stats_workers = min(getattr(self.cfg.train, "num_workers", 0), getattr(self.cfg.dataset, "statistics_num_workers", 16))
+        stats_batch_size = max(int(getattr(self.cfg.dataset, "statistics_batch_size", 64)), 1)
+        loader = DataLoader(
+            subset,
+            batch_size=stats_batch_size,
+            num_workers=stats_workers,
+            shuffle=False,
+            pin_memory=False,
+            persistent_workers=stats_workers > 0,
+            prefetch_factor=2 if stats_workers > 0 else None,
+            collate_fn=dataset.collate,
+        )
+
         data_list = []
-        for idx in indices:
-            item = dataset[idx]
-            if item is None:
+        for batch in loader:
+            if batch is None:
                 continue
-            data_list.append(item["ligand"])
+            lig_batch = batch.get("ligand", None)
+            if lig_batch is None:
+                continue
+            data_list.extend(lig_batch.to_data_list())
+
         if not data_list:
             raise RuntimeError("No valid PLINDER samples available for statistics computation.")
         stats = compute_all_statistics(
@@ -82,6 +159,8 @@ class PlinderDataModule(LightningDataModule):
             num_workers=self.cfg.train.num_workers,
             shuffle=True,
             pin_memory=getattr(self.cfg.dataset, "pin_memory", False),
+            persistent_workers=self.cfg.train.num_workers > 0,
+            prefetch_factor=getattr(self.cfg.train, "prefetch_factor", 2) if self.cfg.train.num_workers > 0 else None,
             collate_fn=self.train_dataset.collate,
         )
 
@@ -92,6 +171,8 @@ class PlinderDataModule(LightningDataModule):
             num_workers=self.cfg.train.num_workers,
             shuffle=False,
             pin_memory=getattr(self.cfg.dataset, "pin_memory", False),
+            persistent_workers=self.cfg.train.num_workers > 0,
+            prefetch_factor=getattr(self.cfg.train, "prefetch_factor", 2) if self.cfg.train.num_workers > 0 else None,
             collate_fn=self.val_dataset.collate,
         )
 
@@ -102,6 +183,8 @@ class PlinderDataModule(LightningDataModule):
             num_workers=self.cfg.train.num_workers,
             shuffle=False,
             pin_memory=getattr(self.cfg.dataset, "pin_memory", False),
+            persistent_workers=self.cfg.train.num_workers > 0,
+            prefetch_factor=getattr(self.cfg.train, "prefetch_factor", 2) if self.cfg.train.num_workers > 0 else None,
             collate_fn=self.test_dataset.collate,
         )
 
@@ -130,6 +213,7 @@ class PlinderInfos(AbstractDatasetInfos):
             pharma_feat=len(FAMILY_MAPPING),
             pharma_coord=3,
         )
+
         self.output_dims = PlaceHolder(
             X=self.num_atom_types,
             charges=6,

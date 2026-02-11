@@ -98,6 +98,8 @@ def to_dense(data, dataset_info, device=None):
     pocket_pos = data.get('pocket_pos') if isinstance(data, dict) else None
     pocket_feat = data.get('pocket_feat') if isinstance(data, dict) else None
     pocket_batch = data.get('pocket_batch') if isinstance(data, dict) else None
+    plip_labels = data.get('plip_labels') if isinstance(data, dict) else None
+    plip_label_mask = data.get('plip_label_mask') if isinstance(data, dict) else None
     pocket_mask = None
     if pocket_pos is not None and pocket_batch is not None:
         if pocket_pos.numel() == 0:
@@ -110,6 +112,7 @@ def to_dense(data, dataset_info, device=None):
             pocket_pos = pocket_pos_dense
             if pocket_feat is not None:
                 pocket_feat, _ = to_dense_batch(x=pocket_feat, batch=pocket_batch)
+            pocket_batch = None
 
     if device is not None:
         X = X.to(device)
@@ -129,10 +132,12 @@ def to_dense(data, dataset_info, device=None):
             pocket_pos = pocket_pos.to(device)
         if pocket_feat is not None:
             pocket_feat = pocket_feat.to(device)
-        if pocket_batch is not None:
-            pocket_batch = pocket_batch.to(device)
         if pocket_mask is not None:
             pocket_mask = pocket_mask.to(device)
+        if plip_labels is not None:
+            plip_labels = plip_labels.to(device)
+        if plip_label_mask is not None:
+            plip_label_mask = plip_label_mask.to(device)
 
     data = PlaceHolder(
         X=X[valid_rows],
@@ -148,10 +153,12 @@ def to_dense(data, dataset_info, device=None):
         pharma_atom_pos=pharma_atom_pos[valid_rows],
         pharma_E=pharma_E[valid_rows],
         pharma_charge=pharma_charge[valid_rows],
-        pocket_pos=pocket_pos,
-        pocket_feat=pocket_feat,
-        pocket_batch=pocket_batch,
-        pocket_mask=pocket_mask,
+        pocket_pos=pocket_pos[valid_rows] if pocket_pos is not None else None,
+        pocket_feat=pocket_feat[valid_rows] if pocket_feat is not None else None,
+        pocket_batch=None,
+        pocket_mask=pocket_mask[valid_rows] if pocket_mask is not None else None,
+        plip_labels=plip_labels[valid_rows] if plip_labels is not None else None,
+        plip_label_mask=plip_label_mask[valid_rows] if plip_label_mask is not None else None,
     )
 
     return data.mask()
@@ -194,6 +201,8 @@ class PlaceHolder:
         pocket_mask=None,
         ref_ligand_pos=None,
         ref_ligand_atom_types=None,
+        plip_labels=None,
+        plip_label_mask=None,
     ):
         self.pos = pos
         self.X = X
@@ -216,6 +225,8 @@ class PlaceHolder:
         self.pocket_mask = pocket_mask
         self.ref_ligand_pos = ref_ligand_pos
         self.ref_ligand_atom_types = ref_ligand_atom_types
+        self.plip_labels = plip_labels
+        self.plip_label_mask = plip_label_mask
 
     def device_as(self, x: torch.Tensor):
         """ Changes the device and dtype of X, E, y. """
@@ -238,6 +249,8 @@ class PlaceHolder:
         self.ref_ligand_atom_types = (
             self.ref_ligand_atom_types.to(x.device) if self.ref_ligand_atom_types is not None else None
         )
+        self.plip_labels = self.plip_labels.to(x.device) if self.plip_labels is not None else None
+        self.plip_label_mask = self.plip_label_mask.to(x.device) if self.plip_label_mask is not None else None
         return self
 
     def mask(self, node_mask=None):
@@ -321,8 +334,11 @@ class PlaceHolder:
             pocket_pos=self.pocket_pos,
             pocket_feat=self.pocket_feat,
             pocket_batch=self.pocket_batch,
+            pocket_mask=self.pocket_mask,
             ref_ligand_pos=self.ref_ligand_pos,
             ref_ligand_atom_types=self.ref_ligand_atom_types,
+            plip_labels=self.plip_labels,
+            plip_label_mask=self.plip_label_mask,
         )
 
 
@@ -350,4 +366,3 @@ def remove_mean_with_mask(x, node_mask):
     #if pharma_coords is not None:
     #    pharma_coords = pharma_coords - mean * pharma_mask.unsqueeze(-1)
     return x, mean
-

@@ -40,6 +40,10 @@ def main(cfg: omegaconf.DictConfig):
     dataset_config = cfg.dataset
     pl.seed_everything(cfg.train.seed)
 
+    torch.backends.cudnn.benchmark = bool(getattr(cfg.general, "cudnn_benchmark", True))
+    if hasattr(torch.backends.cudnn, "deterministic"):
+        torch.backends.cudnn.deterministic = bool(getattr(cfg.general, "deterministic", False))
+
     if dataset_config.name in ['qm9', "geom", "plinder"]:
         if dataset_config.name == 'qm9':
             datamodule = qm9_dataset.QM9DataModule(cfg)
@@ -89,6 +93,12 @@ def main(cfg: omegaconf.DictConfig):
 
     model = FullDenoisingDiffusion(cfg=cfg, dataset_infos=dataset_infos, train_smiles=train_smiles)
 
+    if getattr(cfg.general, "use_torch_compile", False):
+        if hasattr(torch, "compile"):
+            model.model = torch.compile(model.model)
+        else:
+            print("[warning] torch.compile requested but not available in this torch version.")
+
     callbacks = []
     # need to ignore metrics because otherwise ddp tries to sync them
     params_to_ignore = ['module.model.train_smiles', 'module.model.dataset_infos']
@@ -96,25 +106,52 @@ def main(cfg: omegaconf.DictConfig):
     torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, params_to_ignore)
 
     if cfg.train.save_model:
-        checkpoint_callback = ModelCheckpoint(dirpath=f"checkpoints/{cfg.general.name}",
-                                              filename='{epoch}',
+        checkpoint_root = getattr(cfg.general, "checkpoint_dir", "checkpoints")
+        checkpoint_dir = os.path.join(checkpoint_root, cfg.general.name)
+        checkpoint_callback = ModelCheckpoint(dirpath=checkpoint_dir,
+                                              filename='epoch-{epoch:04d}',
                                               monitor='val/epoch_NLL',
                                               save_top_k=-1,
                                               mode='min',
                                               every_n_epochs=1)
         # fix a name and keep overwriting
-        last_ckpt_save = ModelCheckpoint(dirpath=f"checkpoints/{cfg.general.name}", filename='last', every_n_epochs=1)
+        last_ckpt_save = ModelCheckpoint(dirpath=checkpoint_dir, filename='last', every_n_epochs=1)
         callbacks.append(checkpoint_callback)
         callbacks.append(last_ckpt_save)
+        print(f"[checkpoint] saving to: {checkpoint_dir}")
+
+    lightweight_eval_subset_size = getattr(cfg.general, "lightweight_eval_subset_size", None)
+    if lightweight_eval_subset_size is not None and lightweight_eval_subset_size > 0 and not cfg.general.test_only:
+        val_dataset = datamodule.val_dataloader().dataset
+        val_size = len(val_dataset)
+        subset_size = min(int(lightweight_eval_subset_size), val_size)
+        subset_indices = list(range(subset_size))
+        subset_val_dataset = Subset(val_dataset, subset_indices)
+        collate_fn = getattr(getattr(datamodule, "val_dataset", None), "collate", None)
+        val_loader = DataLoader(
+            subset_val_dataset,
+            batch_size=cfg.train.batch_size,
+            shuffle=False,
+            num_workers=cfg.train.num_workers,
+            collate_fn=collate_fn,
+        )
+        datamodule.val_dataloader = lambda: val_loader
+        print(f"[lightweight-eval] Using validation subset size {subset_size}/{val_size}.")
 
     use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
+
+    matmul_precision = getattr(cfg.general, "torch_matmul_precision", None)
+    if matmul_precision is not None:
+        torch.set_float32_matmul_precision(str(matmul_precision))
 
     name = cfg.general.name
     if name == 'debug':
         print("[WARNING]: Run is called 'debug' -- it will run with fast_dev_run. ")
+    
+    strategy = "ddp_find_unused_parameters_true" if use_gpu and cfg.general.gpus > 1 else "auto"
 
     trainer = Trainer(gradient_clip_val=cfg.train.clip_grad,
-                      strategy="ddp_find_unused_parameters_true",  # Needed to load old checkpoints
+                      strategy=strategy,
                       accelerator='gpu' if use_gpu else 'cpu',
                       devices=cfg.general.gpus if use_gpu else 1,
                       max_epochs=cfg.train.n_epochs,
@@ -123,6 +160,9 @@ def main(cfg: omegaconf.DictConfig):
                       enable_progress_bar=cfg.train.progress_bar,
                       callbacks=callbacks,
                       log_every_n_steps=50 if name != 'debug' else 1,
+                      precision=getattr(cfg.general, 'trainer_precision', '32-true'),
+                      accumulate_grad_batches=getattr(cfg.general, 'accumulate_grad_batches', 1),
+                      deterministic=getattr(cfg.general, 'deterministic', False),
                       )
 
     if not cfg.general.test_only:

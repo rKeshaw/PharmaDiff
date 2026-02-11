@@ -232,11 +232,14 @@ class NoiseModel:
         pos_t = a * dense_data.pos + s * noise_pos_masked
 
         z_t = utils.PlaceHolder(X=X_t, charges=charges_t, E=E_t, y=dense_data.y, pos=pos_t, t_int=t_int,
-                                t=t_float, node_mask=dense_data.node_mask, 
-                                pharma_coord=dense_data.pharma_coord, pharma_feat=dense_data.pharma_feat, 
-                                pharma_mask=dense_data.pharma_mask, pharma_atom=dense_data.pharma_atom, 
+                                t=t_float, node_mask=dense_data.node_mask,
+                                pharma_coord=dense_data.pharma_coord, pharma_feat=dense_data.pharma_feat,
+                                pharma_mask=dense_data.pharma_mask, pharma_atom=dense_data.pharma_atom,
                                 pharma_atom_pos=dense_data.pharma_atom_pos, pharma_E=dense_data.pharma_E,
-                                pharma_charge=dense_data.pharma_charge).mask()
+                                pharma_charge=dense_data.pharma_charge,
+                                pocket_pos=dense_data.pocket_pos,
+                                pocket_feat=dense_data.pocket_feat,
+                                pocket_mask=dense_data.pocket_mask).mask()
         return z_t
 
     def get_limit_dist(self):
@@ -267,6 +270,9 @@ class NoiseModel:
             pharma_charge = data.pharma_charge[random_indices]
             pharma_atom_pos = data.pharma_atom_pos[random_indices]
             pharma_E = data.pharma_E[random_indices]
+            pocket_pos = data.pocket_pos[random_indices] if data.pocket_pos is not None else None
+            pocket_feat = data.pocket_feat[random_indices] if data.pocket_feat is not None else None
+            pocket_mask = data.pocket_mask[random_indices] if data.pocket_mask is not None else None
             
         else:
             pharma_coord = sample_condition.pharma_coord.repeat(bs, 1, 1)
@@ -276,7 +282,14 @@ class NoiseModel:
             pharma_charge = sample_condition.pharma_charge.repeat(bs, 1, 1)
             pharma_atom_pos = sample_condition.pharma_atom_pos.repeat(bs, 1, 1)
             pharma_E = sample_condition.pharma_E.repeat(bs, 1, 1, 1)
-
+            if getattr(sample_condition, "pocket_pos", None) is not None:
+                pocket_pos = sample_condition.pocket_pos.repeat(bs, 1, 1)
+                pocket_feat = sample_condition.pocket_feat.repeat(bs, 1, 1)
+                pocket_mask = sample_condition.pocket_mask.repeat(bs, 1)
+            else:
+                pocket_pos = None
+                pocket_feat = None
+                pocket_mask = None
             
             
             #pharma_coord, pharma_feat, pharma_mask, pharma_atom = prepare_pharma_data(sample_condition, n_nodes, bs)
@@ -335,7 +348,8 @@ class NoiseModel:
         return utils.PlaceHolder(X=U_X, charges=U_c, E=U_E, y=U_y, pos=pos, t_int=t_int_array, t=t_array,
                                  node_mask=node_mask, pharma_coord=pharma_coord, pharma_feat=pharma_feat,
                                  pharma_mask=pharma_mask, pharma_atom=pharma_atom, 
-                                 pharma_atom_pos=pharma_atom_pos, pharma_E=pharma_E, pharma_charge=pharma_charge).mask(node_mask)
+                                 pharma_atom_pos=pharma_atom_pos, pharma_E=pharma_E, pharma_charge=pharma_charge,
+                                 pocket_pos=pocket_pos, pocket_feat=pocket_feat, pocket_mask=pocket_mask).mask(node_mask)
 
     def sample_zs_from_zt_and_pred(self, z_t, pred, s_int):
         """Samples from zs ~ p(zs | zt). Only used during sampling. """
@@ -422,7 +436,10 @@ class NoiseModel:
                                 pharma_coord=pred.pharma_coord, pharma_feat=pred.pharma_feat, 
                                 pharma_mask=pred.pharma_mask, pharma_atom=pred.pharma_atom, 
                                 pharma_atom_pos=pred.pharma_atom_pos, pharma_E=pred.pharma_E, 
-                                pharma_charge=pred.pharma_charge).mask(node_mask)
+                                pharma_charge=pred.pharma_charge,
+                                pocket_pos=pred.pocket_pos,
+                                pocket_feat=pred.pocket_feat,
+                                pocket_mask=pred.pocket_mask).mask(node_mask)
         return z_s
     
     def apply_noise_at_sampling(self, t_int, pos, x, pharma_mask):
@@ -449,16 +466,6 @@ class NoiseModel:
         
         return pos_t, x_t
         
-        
-        
-        
-        
-        
-        
-        
-        
-
-
 class DiscreteUniformTransition(NoiseModel):
     def __init__(self, cfg, output_dims):
         super().__init__(cfg=cfg)
@@ -473,7 +480,7 @@ class DiscreteUniformTransition(NoiseModel):
         self.Px = torch.ones(1, self.X_classes, self.X_classes) / self.X_classes
         self.Pcharges = torch.ones(1, self.charges_classes, self.charges_classes) / self.charges_classes
         self.Pe = torch.ones(1, self.E_classes, self.E_classes) / self.E_classes
-        self.Pe = torch.ones(1, self.y_classes, self.y_classes) / self.y_classes
+        self.Py = torch.ones(1, self.y_classes, self.y_classes) / self.y_classes
 
 
 class MarginalUniformTransition(NoiseModel):

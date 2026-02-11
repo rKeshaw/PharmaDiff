@@ -70,6 +70,55 @@ class ConditioningFusion(nn.Module):
         attn_out, _ = self.attn(pharma_feat, pocket_feat_proj, pocket_feat_proj, key_padding_mask=key_padding_mask)
         return self.attn_norm(pharma_feat + attn_out)
 
+class PocketInteractionBlock(nn.Module):
+    """Ligand-to-pocket cross-attention block for explicit pocket awareness."""
+
+    def __init__(self, ligand_dim: int, pocket_feat_dim: int = 8, n_head: int = 4):
+        super().__init__()
+        heads = max(1, min(n_head, ligand_dim))
+        while ligand_dim % heads != 0 and heads > 1:
+            heads -= 1
+        self.pocket_feat_proj = nn.Linear(pocket_feat_dim, ligand_dim)
+        self.pocket_pos_proj = nn.Sequential(
+            nn.Linear(3, ligand_dim),
+            nn.ReLU(),
+            nn.Linear(ligand_dim, ligand_dim),
+        )
+        self.cross_attn = nn.MultiheadAttention(embed_dim=ligand_dim, num_heads=heads, batch_first=True)
+        self.out_norm = nn.LayerNorm(ligand_dim)
+
+    def forward(
+        self,
+        ligand_h: torch.Tensor,
+        pocket_pos: Optional[torch.Tensor],
+        pocket_feat: Optional[torch.Tensor],
+        pocket_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if pocket_pos is None or pocket_feat is None:
+            return ligand_h
+        if pocket_pos.dim() != 3 or pocket_feat.dim() != 3:
+            return ligand_h
+        if pocket_pos.size(1) == 0 or pocket_feat.size(1) == 0:
+            return ligand_h
+
+        pocket_h = self.pocket_feat_proj(pocket_feat) + self.pocket_pos_proj(pocket_pos)
+
+        key_padding_mask = None
+        if pocket_mask is not None:
+            if pocket_mask.dim() != 2:
+                return ligand_h
+            if (pocket_mask.sum(dim=1) == 0).any():
+                return ligand_h
+            key_padding_mask = ~pocket_mask
+
+        attn_out, _ = self.cross_attn(
+            query=ligand_h,
+            key=pocket_h,
+            value=pocket_h,
+            key_padding_mask=key_padding_mask,
+        )
+        return self.out_norm(ligand_h + attn_out)
+    
 class XEyTransformerLayer(nn.Module):
     """ Transformer that updates node, edge and global features
         d_x: node features
@@ -483,7 +532,8 @@ class GraphTransformer(nn.Module):
     dims : dict -- contains dimensions for each feature type
     """
     def __init__(self, input_dims: utils.PlaceHolder, n_layers: int, hidden_mlp_dims: dict, hidden_dims: dict,
-                 output_dims: utils.PlaceHolder, conditioning_fusion: str = "concat"):
+                 output_dims: utils.PlaceHolder, conditioning_fusion: str = "concat",
+                 use_pocket_interaction: bool = True):
         super().__init__()
         self.n_layers = n_layers
         self.out_dim_X = output_dims.X
@@ -492,9 +542,15 @@ class GraphTransformer(nn.Module):
         self.out_dim_charges = output_dims.charges
         self.input_dims = input_dims
         self.outdim = output_dims
+        self.use_pocket_interaction = use_pocket_interaction
         self.conditioning_fusion = ConditioningFusion(
             cond_dim=input_dims.pharma_feat,
             fusion_type=conditioning_fusion,
+        )
+        self.pocket_interaction = PocketInteractionBlock(
+            ligand_dim=hidden_dims['dx'],
+            pocket_feat_dim=8,
+            n_head=hidden_dims['n_head'],
         )
 
         act_fn_in = nn.ReLU()
@@ -601,7 +657,14 @@ class GraphTransformer(nn.Module):
         new_E = self.mlp_in_E(E_masked)
         new_E = (new_E + new_E.transpose(1, 2)) / 2
         
-        new_X = self.mlp_in_X(X_all) 
+        new_X = self.mlp_in_X(X_all)
+        if self.use_pocket_interaction:
+            new_X = self.pocket_interaction(
+                ligand_h=new_X,
+                pocket_pos=data.pocket_pos,
+                pocket_feat=data.pocket_feat,
+                pocket_mask=data.pocket_mask,
+            )
         
         X_masked = torch.where(data.pharma_mask.unsqueeze(-1) > 0, feats_atoms, new_X) 
         
@@ -636,7 +699,10 @@ class GraphTransformer(nn.Module):
                                 pharma_coord=data.pharma_coord, pharma_feat=data.pharma_feat, 
                                 pharma_mask=data.pharma_mask, pharma_atom=data.pharma_atom, 
                                 pharma_atom_pos=data.pharma_atom_pos, pharma_E = data.pharma_E, 
-                                pharma_charge= data.pharma_charge).mask()
+                                pharma_charge= data.pharma_charge,
+                                pocket_pos=data.pocket_pos,
+                                pocket_feat=data.pocket_feat,
+                                pocket_mask=data.pocket_mask).mask()
             
             
             
@@ -672,7 +738,10 @@ class GraphTransformer(nn.Module):
                                         pharma_coord=data.pharma_coord, pharma_feat=data.pharma_feat, 
                                         pharma_mask=data.pharma_mask, pharma_atom=data.pharma_atom, 
                                         pharma_atom_pos=data.pharma_atom_pos, pharma_E = data.pharma_E, 
-                                        pharma_charge=data.pharma_charge).mask()
+                                        pharma_charge=data.pharma_charge,
+                                        pocket_pos=data.pocket_pos,
+                                        pocket_feat=data.pocket_feat,
+                                        pocket_mask=data.pocket_mask).mask()
                 outputs.append(out)
             return outputs
         

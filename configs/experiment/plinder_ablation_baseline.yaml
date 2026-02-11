@@ -1,0 +1,6 @@
+# @package _global_
+general:
+  name: 'plinder-ablation-baseline'
+
+model:
+  use_pocket_interaction: false

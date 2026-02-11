@@ -30,9 +30,14 @@ def train_affinity_predictor(
     if use_precomputed:
         sampler = None
     else:
-        affinities = dataset.index['affinity_data.pKd'].values
-        weights = torch.tensor([5.0 if a > 7.0 else 1.0 for a in affinities], dtype=torch.float)
-        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        affinity_col = getattr(dataset, 'affinity_column', None)
+        if affinity_col is not None:
+            affinities = dataset.index[affinity_col].values
+            weights = torch.tensor([5.0 if a > 7.0 else 1.0 for a in affinities], dtype=torch.float)
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        else:
+            print('Warning: affinity column missing; disabling affinity-based sampler weights.')
+            sampler = None
     
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -55,7 +60,8 @@ def train_affinity_predictor(
     noise_scheduler = NoiseModel(cfg)
     
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = torch.nn.MSELoss()
+    affinity_loss_fn = torch.nn.MSELoss()
+    ifp_loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
 
     # 3. Training Loop
     model.train()
@@ -94,7 +100,7 @@ def train_affinity_predictor(
             lig_feat_one_hot = F.one_hot(lig_feat, num_classes=num_types).float()
             
             # D. Predict Affinity from NOISY structure
-            pred_affinity = model(
+            pred_out = model(
                 lig_pos_noisy,
                 lig_feat_one_hot,
                 prot_pos,
@@ -103,11 +109,25 @@ def train_affinity_predictor(
                 lig_batch=lig_batch_idx,
                 prot_batch=prot_batch_idx,
             )
+            pred_affinity = pred_out["affinity"]
+            pred_ifp_logits = pred_out["ifp_logits"]
             
             # E. Loss
             # We want the model to predict the TRUE affinity even from noisy structures
             # This teaches it the "gradient direction" towards the clean, high-affinity state
-            loss = loss_fn(pred_affinity, true_affinity)
+            loss_affinity = affinity_loss_fn(pred_affinity, true_affinity)
+
+            if "plip_labels" in batch and "plip_label_mask" in batch:
+                true_ifp = batch["plip_labels"].to(device)
+                ifp_mask = batch["plip_label_mask"].to(device)
+                raw_ifp_loss = ifp_loss_fn(pred_ifp_logits, true_ifp)
+                masked_ifp_loss = raw_ifp_loss * ifp_mask
+                valid = ifp_mask.sum()
+                loss_ifp = masked_ifp_loss.sum() / valid.clamp(min=1.0)
+            else:
+                loss_ifp = pred_ifp_logits.new_tensor(0.0)
+
+            loss = loss_affinity + 0.5 * loss_ifp
             
             loss.backward()
             optimizer.step()

@@ -5,15 +5,20 @@ import math
 import matplotlib.pyplot as plt
 from pharmadiff.utils import PlaceHolder, remove_mean_with_mask
 
+def _is_dynamo_compiling() -> bool:
+    return bool(hasattr(torch, "_dynamo") and torch._dynamo.is_compiling())
 
 def sum_except_batch(x):
     return x.reshape(x.size(0), -1).sum(dim=-1)
 
 
 def assert_correctly_masked(variable, node_mask):
+    # Skip Python scalar extraction under torch.compile to avoid graph breaks.
+    if _is_dynamo_compiling():
+        return
     assert not torch.isnan(variable).any(), f"Shape:{variable.shape}"
-    assert (variable * (1 - node_mask.long())).abs().max().item() < 1e-4, \
-        f'Variables not masked properly. {variable * (1 - node_mask.long())}'
+    masked_error = (variable * (1 - node_mask.long())).abs().max()
+    assert masked_error < 1e-4, f'Variables not masked properly. max error={masked_error.item():.3e}'
 
 
 def sample_gaussian_with_mask(size, node_mask):
@@ -27,8 +32,9 @@ def remove_mean_with_mask(pos, node_mask):
         node_mask: bs x n (bool)"""
     assert node_mask.dtype == torch.bool, f"Wrong dtype for the mask: {node_mask.dtype}"
     node_mask = node_mask.unsqueeze(-1)
-    masked_max_abs_value = (pos * (~node_mask)).abs().sum().item()
-    assert masked_max_abs_value < 1e-5, f'Error {masked_max_abs_value} too high'
+    if not _is_dynamo_compiling():
+        masked_max_abs_value = (pos * (~node_mask)).abs().sum()
+        assert masked_max_abs_value < 1e-5, f'Error {masked_max_abs_value.item()} too high'
     N = node_mask.sum(1, keepdims=True)
 
     mean = torch.sum(pos, dim=1, keepdim=True) / N

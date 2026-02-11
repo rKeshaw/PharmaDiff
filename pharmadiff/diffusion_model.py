@@ -11,6 +11,7 @@ import wandb
 from rdkit import Chem
 import pickle
 import random
+import json
 from torch_geometric.data import Batch
 from torch_geometric.utils import to_dense_batch
 
@@ -91,7 +92,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                       hidden_mlp_dims=cfg.model.hidden_mlp_dims,
                                       hidden_dims=cfg.model.hidden_dims,
                                       output_dims=self.output_dims,
-                                      conditioning_fusion=getattr(cfg.model, "conditioning_fusion", "concat"))
+                                      conditioning_fusion=getattr(cfg.model, "conditioning_fusion", "concat"),
+                                      use_pocket_interaction=getattr(cfg.model, "use_pocket_interaction", True))
 
         if cfg.model.transition == 'uniform':
             self.noise_model = DiscreteUniformTransition(output_dims=self.output_dims,
@@ -100,9 +102,27 @@ class FullDenoisingDiffusion(pl.LightningModule):
             print(f"Marginal distribution of the classes: nodes: {self.dataset_infos.atom_types} --"
                   f" edges: {self.dataset_infos.edge_types} -- charges: {self.dataset_infos.charges_marginals}")
 
-            self.noise_model = MarginalUniformTransition(x_marginals=self.dataset_infos.atom_types,
-                                                         e_marginals=self.dataset_infos.edge_types,
-                                                         charges_marginals=self.dataset_infos.charges_marginals,
+            def _align_marginals(marginals, target_dim: int, name: str):
+                m = torch.as_tensor(marginals, dtype=torch.float32)
+                if m.numel() == target_dim:
+                    pass
+                elif m.numel() < target_dim:
+                    pad = torch.full((target_dim - m.numel(),), 1e-8, dtype=torch.float32)
+                    m = torch.cat([m, pad], dim=0)
+                    print(f"[noise-model] padded {name} marginals from {marginals.shape[0] if hasattr(marginals, 'shape') else len(marginals)} to {target_dim}")
+                else:
+                    m = m[:target_dim]
+                    print(f"[noise-model] truncated {name} marginals from {marginals.shape[0] if hasattr(marginals, 'shape') else len(marginals)} to {target_dim}")
+                m = m / m.sum().clamp(min=1e-12)
+                return m
+
+            x_marginals = _align_marginals(self.dataset_infos.atom_types, self.output_dims.X, "X")
+            e_marginals = _align_marginals(self.dataset_infos.edge_types, self.output_dims.E, "E")
+            c_marginals = _align_marginals(self.dataset_infos.charges_marginals, self.output_dims.charges, "charges")
+
+            self.noise_model = MarginalUniformTransition(x_marginals=x_marginals,
+                                                         e_marginals=e_marginals,
+                                                         charges_marginals=c_marginals,
                                                          y_classes=self.output_dims.y,
                                                          cfg=cfg)
         else:
@@ -239,6 +259,12 @@ class FullDenoisingDiffusion(pl.LightningModule):
 
         if wandb.run:
             wandb.log(log_dict)
+        
+        metrics_out = getattr(self.cfg.general, "test_metrics_output_path", None)
+        if metrics_out and self.global_rank == 0:
+            os.makedirs(os.path.dirname(metrics_out) or ".", exist_ok=True)
+            with open(metrics_out, "w") as f:
+                json.dump({k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v) for k, v in log_dict.items()}, f, indent=2)
 
         print(f"Sampling start on GR{self.global_rank}")
         start = time.time()
@@ -247,6 +273,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
         
         samples = []
         mols_list = []
+
+        generation_root = getattr(self.cfg.general, "generation_output_dir", "generated")
+        run_output_dir = os.path.join(generation_root, f"{self.name}_epoch{self.current_epoch}_gr{self.global_rank}_{int(time.time())}")
+        os.makedirs(run_output_dir, exist_ok=True)
         
         if self.cfg.general.sample_condition is not None:
             
@@ -270,9 +300,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                                  pharma_atom_pos=condition_subset.pharma_atom_pos[i],
                                                  pharma_E=condition_subset.pharma_E[i],
                                                  pharma_charge=condition_subset.pharma_charge[i],
-                                                 pocket_pos=condition_subset.pocket_pos,
-                                                 pocket_feat=condition_subset.pocket_feat,
-                                                 pocket_batch=condition_subset.pocket_batch,
+                                                 pocket_pos=condition_subset.pocket_pos[i] if condition_subset.pocket_pos is not None else None,
+                                                 pocket_feat=condition_subset.pocket_feat[i] if condition_subset.pocket_feat is not None else None,
+                                                 pocket_mask=condition_subset.pocket_mask[i] if condition_subset.pocket_mask is not None else None,
+                                                 plip_labels=condition_subset.plip_labels[i] if getattr(condition_subset, 'plip_labels', None) is not None else None,
+                                                 plip_label_mask=condition_subset.plip_label_mask[i] if getattr(condition_subset, 'plip_label_mask', None) is not None else None,
                                                  ref_ligand_pos=ref_ligand_pos,
                                                  ref_ligand_atom_types=ref_ligand_atom_types)
                 
@@ -282,9 +314,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                                 test=True, sample_condition=condition)
                 
                 rdkit_mols = [mol.rdkit_mol for mol in samples_i]
-                
-                writer = Chem.SDWriter("generated_mols_output.sdf")
 
+                sdf_path = os.path.join(run_output_dir, f"generated_mols_output_{i}.sdf")
+                writer = Chem.SDWriter(sdf_path)
+                
                 for mol in rdkit_mols:
                     if mol is not None:
                         writer.write(mol)
@@ -324,9 +357,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                                  pharma_atom_pos=condition_subset.pharma_atom_pos[i],
                                                  pharma_E=condition_subset.pharma_E[i],
                                                  pharma_charge=condition_subset.pharma_charge[i],
-                                                 pocket_pos=condition_subset.pocket_pos,
-                                                 pocket_feat=condition_subset.pocket_feat,
-                                                 pocket_batch=condition_subset.pocket_batch,
+                                                 pocket_pos=condition_subset.pocket_pos[i] if condition_subset.pocket_pos is not None else None,
+                                                 pocket_feat=condition_subset.pocket_feat[i] if condition_subset.pocket_feat is not None else None,
+                                                 pocket_mask=condition_subset.pocket_mask[i] if condition_subset.pocket_mask is not None else None,
+                                                 plip_labels=condition_subset.plip_labels[i] if getattr(condition_subset, 'plip_labels', None) is not None else None,
+                                                 plip_label_mask=condition_subset.plip_label_mask[i] if getattr(condition_subset, 'plip_label_mask', None) is not None else None,
                                                  ref_ligand_pos=ref_ligand_pos,
                                                  ref_ligand_atom_types=ref_ligand_atom_types)
                 
@@ -340,12 +375,22 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 samples.extend(samples_i)
             
         print("Saving the generated graphs")
-        filename = f'generated_mols.pkl'
+        filename = os.path.join(run_output_dir, 'generated_mols.pkl')
         
         with open(filename, 'wb') as f:
-            pickle.dump(mols_list, f) 
+            pickle.dump(mols_list, f)
 
-        print("Saved.")
+        meta = {
+            'run_name': self.name,
+            'epoch': int(self.current_epoch),
+            'global_rank': int(self.global_rank),
+            'num_generated_molecule_groups': int(len(mols_list)),
+            'test_sampling_num_per_graph': int(self.test_sampling_num_per_graph),
+        }
+        with open(os.path.join(run_output_dir, 'generation_meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"Saved generation artifacts to {run_output_dir}")
         print("Computing sampling metrics...")
         self.test_sampling_metrics(samples, self.name, self.current_epoch, self.local_rank)
         print(f'Done. Sampling took {time.time() - start:.2f} seconds\n')
@@ -511,7 +556,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
         for s_int in reversed(range(0, self.T, 1 if test else self.cfg.general.faster_sampling)):
             s_array = s_int * torch.ones((batch_size, 1), dtype=torch.long, device=z_t.X.device)
 
-            z_s = self.sample_zs_from_zt(z_t=z_t, s_int=s_array, sample_condition=sample_condition, guidance_scale=g_scale)
+            step_g_scale = self._scheduled_guidance_scale(g_scale, z_t)
+            z_s = self.sample_zs_from_zt(z_t=z_t, s_int=s_array, sample_condition=sample_condition, guidance_scale=step_g_scale)
 
             # Save the first keep_chain graphs
             if s_int != 0 and (s_int * number_chain_steps) % self.T == 0:
@@ -643,6 +689,25 @@ class FullDenoisingDiffusion(pl.LightningModule):
         grads = torch.autograd.grad(potential, z_t_pos)[0]
         return grads
     
+    def _scheduled_guidance_scale(self, base_scale: float, z_t) -> float:
+        schedule = getattr(self.cfg.general, "guidance_schedule", "constant")
+        min_ratio = float(getattr(self.cfg.general, "guidance_min_scale_ratio", 0.2))
+        min_ratio = max(0.0, min(1.0, min_ratio))
+
+        t_int = z_t.t_int.float()
+        if t_int.dim() == 0:
+            t_norm = torch.clamp(t_int / max(1.0, float(self.T)), 0.0, 1.0).item()
+        else:
+            t_norm = torch.clamp(t_int.mean() / max(1.0, float(self.T)), 0.0, 1.0).item()
+
+        if schedule == "linear_ramp":
+            factor = min_ratio + (1.0 - min_ratio) * (1.0 - t_norm)
+        elif schedule == "cosine_ramp":
+            factor = min_ratio + (1.0 - min_ratio) * (0.5 * (1.0 + math.cos(math.pi * t_norm)))
+        else:
+            factor = 1.0
+        return float(base_scale) * float(factor)
+    
     def sample_zs_from_zt(self, z_t, s_int, test=False, sample_condition=None, guidance_scale=0.0):
         """
         Samples zs ~ p(zs | zt) with Affinity Guidance.
@@ -674,19 +739,56 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 n_ensemble = 3
                 accumulated_grad_pos = torch.zeros_like(z_t_pos)
                 accumulated_grad_X = torch.zeros_like(z_t_X_hot)
+                ifp_scale = getattr(self.cfg.general, "ifp_guidance_scale", 0.5)
+                pharma_scale = getattr(self.cfg.general, "pharma_guidance_scale", 0.1)
 
                 for _ in range(n_ensemble):
                     # Predict affinity
-                    predicted_affinity = self.affinity_model(
+                    pred_out = self.affinity_model(
                         lig_pos=z_t_pos, lig_feat=z_t_X_hot,
                         prot_pos=sample_condition.pocket_pos,
                         prot_feat=sample_condition.pocket_feat,
                         t=s_int,
                         lig_mask=z_t.node_mask,
-                        prot_batch=getattr(sample_condition, "pocket_batch", None),
+                        prot_mask=getattr(sample_condition, "pocket_mask", None),
                     )
+
+                    predicted_affinity = pred_out["affinity"] if isinstance(pred_out, dict) else pred_out
+
+                    ifp_obj = 0.0
+                    if isinstance(pred_out, dict) and "ifp_logits" in pred_out:
+                        pred_ifp_prob = torch.sigmoid(pred_out["ifp_logits"])
+                        ref_ifp = getattr(sample_condition, "plip_labels", None)
+                        ref_ifp_mask = getattr(sample_condition, "plip_label_mask", None)
+                        if ref_ifp is not None:
+                            ref_ifp = ref_ifp.to(pred_ifp_prob.device)
+                            if ref_ifp.dim() == 1:
+                                ref_ifp = ref_ifp.unsqueeze(0).expand(pred_ifp_prob.size(0), -1)
+                            if ref_ifp_mask is not None:
+                                ref_ifp_mask = ref_ifp_mask.to(pred_ifp_prob.device)
+                                if ref_ifp_mask.dim() == 1:
+                                    ref_ifp_mask = ref_ifp_mask.unsqueeze(0).expand(pred_ifp_prob.size(0), -1)
+                                ifp_obj = (pred_ifp_prob * ref_ifp * ref_ifp_mask).sum()
+                            else:
+                                ifp_obj = (pred_ifp_prob * ref_ifp).sum()
+                        else:
+                            ifp_obj = pred_ifp_prob.sum()
+
+                    pharma_obj = 0.0
+                    if getattr(sample_condition, "pharma_coord", None) is not None and getattr(sample_condition, "pharma_mask", None) is not None:
+                        pharma_coord = sample_condition.pharma_coord.to(z_t_pos.device)
+                        pharma_mask = sample_condition.pharma_mask.to(z_t_pos.device).bool()
+                        if pharma_coord.dim() == 2:
+                            pharma_coord = pharma_coord.unsqueeze(0).expand(z_t_pos.size(0), -1, -1)
+                        if pharma_mask.dim() == 1:
+                            pharma_mask = pharma_mask.unsqueeze(0).expand(z_t_pos.size(0), -1)
+                        pharma_dist = torch.norm((z_t_pos - pharma_coord) * pharma_mask.unsqueeze(-1), dim=-1)
+                        pharma_obj = -pharma_dist.sum()
+
+                    total_obj = predicted_affinity.sum() + ifp_scale * ifp_obj + pharma_scale * pharma_obj
+
                     # Compute Gradients (Maximize Affinity)
-                    grads = torch.autograd.grad(predicted_affinity.sum(), [z_t_pos, z_t_X_hot], retain_graph=True)
+                    grads = torch.autograd.grad(total_obj, [z_t_pos, z_t_X_hot], retain_graph=True)
                     accumulated_grad_pos += grads[0] / n_ensemble
                     accumulated_grad_X += grads[1] / n_ensemble                
 
@@ -900,12 +1002,28 @@ class FullDenoisingDiffusion(pl.LightningModule):
             return None, None
 
         loss_map = (dist_map - target_map) ** 2
-        loss = (loss_map * base_mask).sum() / base_mask.sum().clamp(min=1)
+
+        quality_weight = data.get("quality_weight")
+        if quality_weight is not None:
+            quality_weight = quality_weight.to(pred.pos.device).view(-1)
+            if quality_weight.numel() != pred.pos.shape[0]:
+                quality_weight = None
+
+        if quality_weight is None:
+            loss = (loss_map * base_mask).sum() / base_mask.sum().clamp(min=1)
+        else:
+            masked_loss = loss_map * base_mask
+            valid_counts = base_mask.sum(dim=(1, 2)).clamp(min=1)
+            per_graph_loss = masked_loss.sum(dim=(1, 2)) / valid_counts
+            loss = (per_graph_loss * quality_weight).sum() / quality_weight.sum().clamp(min=1e-6)
+
         weighted_loss = weight * loss
         log_dict = {
             "train_loss/interaction_map_mse": loss.detach(),
             "train_loss/interaction_map_weighted": weighted_loss.detach(),
         }
+        if quality_weight is not None:
+            log_dict["train_loss/quality_weight_mean"] = quality_weight.mean().detach()
         return weighted_loss, log_dict
 
     def on_train_epoch_end(self) -> None:

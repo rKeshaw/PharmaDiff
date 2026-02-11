@@ -13,8 +13,9 @@ class EGNNConv(nn.Module):
         return self.conv(x, edge_index)
 
 class TimeAwareAffinityPredictor(nn.Module):
-    def __init__(self, ligand_in_dim=15, protein_in_dim=8, hidden_dim=64):
+    def __init__(self, ligand_in_dim=15, protein_in_dim=8, hidden_dim=64, ifp_dim: int = 6):
         super().__init__()
+        self.ifp_dim = ifp_dim
         
         # 1. Feature Embeddings
         self.lig_emb = nn.Linear(ligand_in_dim, hidden_dim)
@@ -33,10 +34,15 @@ class TimeAwareAffinityPredictor(nn.Module):
         self.conv3 = EGNNConv(hidden_dim, hidden_dim)
         
         # 4. Readout
-        self.readout = nn.Sequential(
+        self.affinity_readout = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 1) # Predicts pKd
+        )
+        self.ifp_readout = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, ifp_dim),
         )
 
     def _get_time_embedding(self, t, dim):
@@ -84,6 +90,7 @@ class TimeAwareAffinityPredictor(nn.Module):
         prot_batch: Optional[torch.Tensor] = None,
         lig_mask: Optional[torch.Tensor] = None,
         prot_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
     ):
         """
         Args:
@@ -125,7 +132,11 @@ class TimeAwareAffinityPredictor(nn.Module):
         from torch_geometric.nn import global_mean_pool
         ligand_readout = global_mean_pool(x[:lig_pos.shape[0]], lig_batch)
         
-        return self.readout(ligand_readout)
+        affinity = self.affinity_readout(ligand_readout)
+        ifp_logits = self.ifp_readout(ligand_readout)
+        if return_dict:
+            return {"affinity": affinity, "ifp_logits": ifp_logits}
+        return affinity
 
     def _build_edges(self, pos, batch_idx, radius=5.0):
         from torch_cluster import radius_graph

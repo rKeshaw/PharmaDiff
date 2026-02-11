@@ -8,6 +8,7 @@ resume: null            # If resume, path to ckpt file from outputs directory in
 test_only: null         # Use absolute path
 
 check_val_every_n_epochs: 30
+lightweight_eval_subset_size: null
 sample_every_val: 1
 val_check_interval: null
 samples_to_generate: 1024
@@ -30,3 +31,20 @@ num_final_sampling: 1
 sample_condition : null
 
 test_sampling_num_per_graph: 1000
+ifp_guidance_scale: 0.5
+pharma_guidance_scale: 0.1
+guidance_schedule: cosine_ramp            # constant | linear_ramp | cosine_ramp
+guidance_min_scale_ratio: 0.2            # minimum ratio at early timesteps
+
+test_metrics_output_path: null            # optional json output path for test metrics summary
+generation_output_dir: generated          # base dir for saved generated molecules/artifacts
+checkpoint_dir: checkpoints                # base dir for model checkpoints (inside hydra run dir unless absolute)
+
+torch_matmul_precision: "high"            # highest | high | medium
+trainer_precision: "32-true"              # e.g. 16-mixed, bf16-mixed, 32-true
+accumulate_grad_batches: 1
+use_torch_compile: false
+
+# Reproducibility / backend tuning
+deterministic: false
+cudnn_benchmark: true

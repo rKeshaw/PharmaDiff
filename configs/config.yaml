@@ -4,6 +4,7 @@ defaults:
     - model : discrete
     - train : train_default
     - dataset : geom
+    - optional experiment: null
 
 
 hydra:
@@ -11,8 +12,4 @@ hydra:
     chdir: True
   run:
     dir: ../outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${general.name}
-
-
-
-
 

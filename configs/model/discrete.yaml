@@ -8,6 +8,7 @@ n_layers: 12
 
 extra_features: null        # 'all', 'cycles', 'eigenvalues' or null
 conditioning_fusion: concat # concat, gated, cross-attn
+use_pocket_interaction: true
 
 hidden_mlp_dims: {'X': 256, 'E': 64, 'y': 256, 'pos': 64, 'pharma_faet': 16, 'pharma_pos': 32 }
 
@@ -21,5 +22,3 @@ nu:
   c: 1
   e: 1.5
   y: 1
-
-
