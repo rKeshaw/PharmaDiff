@@ -85,7 +85,6 @@ def main(cfg: omegaconf.DictConfig):
             print(f"number of test samples: {len(datamodule.test_dataloader())}")
         
     elif cfg.general.resume is not None:
-        # When resuming, we can override some parts of previous configuration
         print("Resuming from {}".format(cfg.general.resume))
         cfg, _ = get_resume(cfg, dataset_infos, train_smiles, cfg.general.resume, test=False)
 
@@ -100,7 +99,6 @@ def main(cfg: omegaconf.DictConfig):
             print("[warning] torch.compile requested but not available in this torch version.")
 
     callbacks = []
-    # need to ignore metrics because otherwise ddp tries to sync them
     params_to_ignore = ['module.model.train_smiles', 'module.model.dataset_infos']
 
     torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, params_to_ignore)
@@ -108,17 +106,17 @@ def main(cfg: omegaconf.DictConfig):
     if cfg.train.save_model:
         checkpoint_root = getattr(cfg.general, "checkpoint_dir", "checkpoints")
         checkpoint_dir = os.path.join(checkpoint_root, cfg.general.name)
+        os.makedirs(checkpoint_dir, exist_ok=True)
         checkpoint_callback = ModelCheckpoint(dirpath=checkpoint_dir,
                                               filename='epoch-{epoch:04d}',
                                               monitor='val/epoch_NLL',
                                               save_top_k=-1,
                                               mode='min',
-                                              every_n_epochs=1)
-        # fix a name and keep overwriting
-        last_ckpt_save = ModelCheckpoint(dirpath=checkpoint_dir, filename='last', every_n_epochs=1)
+                                              every_n_epochs=1,
+                                              save_last=True,
+                                              save_on_train_epoch_end=True)
         callbacks.append(checkpoint_callback)
-        callbacks.append(last_ckpt_save)
-        print(f"[checkpoint] saving to: {checkpoint_dir}")
+        print(f"[checkpoint] saving to: {os.path.abspath(checkpoint_dir)}")
 
     lightweight_eval_subset_size = getattr(cfg.general, "lightweight_eval_subset_size", None)
     if lightweight_eval_subset_size is not None and lightweight_eval_subset_size > 0 and not cfg.general.test_only:
@@ -171,7 +169,6 @@ def main(cfg: omegaconf.DictConfig):
         # if cfg.general.name not in ['debug', 'test']:
         #     trainer.test(model, datamodule=datamodule)
     else:
-        # Start by evaluating test_only_path
         for i in range(cfg.general.num_final_sampling):
             trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
         if cfg.general.evaluate_all_checkpoints:

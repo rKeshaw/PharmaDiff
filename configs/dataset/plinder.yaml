@@ -1,26 +1,33 @@
 name: 'plinder'
 datadir: 'data/plinder/'
 remove_h: False
-random_subset: null
+random_subset: null       
+max_entries: null
 pin_memory: False
 adaptive_loader: False
+
 pocket_radius: 10.0
 contact_cutoff: 4.5
-min_pocket_atoms: 1
-min_affinity: null
-max_entry_resolution: null
-require_rdkit_ligand: false
-pocket_structure_mode: 'holo_only'  # holo_only, apo_only, pred_only, apo_pred_random
+min_pocket_atoms: 10
+
+max_entry_resolution: 3.5 
+max_entry_validation_clashscore: 20.0 
+require_ligand_is_proper: True
+exclude_ligand_artifacts: True
+require_rdkit_ligand: True
+pocket_structure_mode: 'holo_only'
 apo_pred_swap_prob: 0.0
 max_collision_score: null
-require_posebusters_connected: false
-cluster_column: null
+require_posebusters_connected: True
+
+min_affinity: null                        
+require_system_has_binding_affinity: False
+min_system_num_interactions: 1
+min_ligand_num_interactions: 1
+cluster_column: null                      
 allowed_clusters: null
-use_sample_cache: false
+
+use_sample_cache: True                    # 
 sample_cache_dir: 'data/plinder/sample_cache'
 sample_cache_version: 'v2'
-statistics_max_samples: 2000
-statistics_num_workers: 16
-statistics_batch_size: 64
-statistics_cache_path: 'data/plinder/statistics.pt'
 statistics_force_recompute: False

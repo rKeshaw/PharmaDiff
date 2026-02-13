@@ -51,20 +51,22 @@ def evaluate_generation(generated_mols, protein_pdb, pocket_center):
     """
     Main evaluation loop.
     """
-    results = {'affintiy': [], 'clashes': []}
+    results = {'affinity': [], 'clashes': []}
 
     for mol in generated_mols:
         clashes = calculate_clash_score(mol, protein_pdb)
         results['clashes'].append(clashes)
 
         if clashes < 3:
-            affintiy = calculate_vina_affinity(mol, protein_pdb, pocket_center)
-            results['affintiy'].append(affintiy)
+            affinity = calculate_vina_affinity(mol, protein_pdb, pocket_center)
+            results['affinity'].append(affinity)
         else:
             results['affinity'].append(0.0) # Penalize for clashes
 
-    print(f"Mean Clashes: {np.mean(results['clashes'])}")
-    print(f"Mean Affinity: {np.mean(results['affintiy'])}")
+    mean_clashes = float(np.mean(results['clashes'])) if results['clashes'] else 0.0
+    mean_affinity = float(np.mean(results['affinity'])) if results['affinity'] else 0.0
+    print(f"Mean Clashes: {mean_clashes}")
+    print(f"Mean Affinity: {mean_affinity}")
 
     return results
 

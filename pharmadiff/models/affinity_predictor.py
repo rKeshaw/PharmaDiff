@@ -17,23 +17,21 @@ class TimeAwareAffinityPredictor(nn.Module):
         super().__init__()
         self.ifp_dim = ifp_dim
         
-        # 1. Feature Embeddings
+        # Feature Embeddings
         self.lig_emb = nn.Linear(ligand_in_dim, hidden_dim)
         self.prot_emb = nn.Linear(protein_in_dim, hidden_dim)
         
-        # 2. Time Embedding (Sinusoidal - same as Diffusion Model)
+        # Time Embedding (Sinusoidal)
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # 3. Time-Conditioned EGNN Layers
         self.conv1 = EGNNConv(hidden_dim, hidden_dim)
         self.conv2 = EGNNConv(hidden_dim, hidden_dim)
         self.conv3 = EGNNConv(hidden_dim, hidden_dim)
         
-        # 4. Readout
         self.affinity_readout = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -46,7 +44,6 @@ class TimeAwareAffinityPredictor(nn.Module):
         )
 
     def _get_time_embedding(self, t, dim):
-        # Standard Sinusoidal Embedding
         half_dim = dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
@@ -108,18 +105,18 @@ class TimeAwareAffinityPredictor(nn.Module):
             t = t.expand(num_graphs)
 
         # Embed Time
-        t_emb = self._get_time_embedding(t, 64) # Assuming hidden_dim=64
+        t_emb = self._get_time_embedding(t, 64) 
         t_emb = self.time_mlp(t_emb)
         
         # Combine Graphs (Ligand + Protein)
         t_node = t_emb[lig_batch]  # Inject per-graph time into ligand nodes
         x_lig = self.lig_emb(lig_feat) + t_node
-        x_prot = self.prot_emb(prot_feat) # Protein is clean, no time needed (or add it too)
+        x_prot = self.prot_emb(prot_feat) 
         
         x = torch.cat([x_lig, x_prot], dim=0)
         pos = torch.cat([lig_pos, prot_pos], dim=0)
         
-        # Create edges (simplified radius graph)
+        # Create edges based on proximity 
         batch_idx = torch.cat([lig_batch, prot_batch], dim=0)
         edge_index = self._build_edges(pos, batch_idx) 
 
@@ -128,7 +125,7 @@ class TimeAwareAffinityPredictor(nn.Module):
         x = self.conv2(x, edge_index, coord=pos)
         x = self.conv3(x, edge_index, coord=pos)
         
-        # Global Pooling (Only pool the LIGAND nodes for prediction)
+        # Global Pooling 
         from torch_geometric.nn import global_mean_pool
         ligand_readout = global_mean_pool(x[:lig_pos.shape[0]], lig_batch)
         

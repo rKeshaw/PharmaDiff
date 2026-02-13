@@ -123,7 +123,7 @@ def pharmacophore_to_torch(feat_arr, idx_arr_list, coord_arr, pos_mean, mol, nam
         num = [2, 3, 4]
         num_p = [0.333, 0.334, 0.333]  # P(Number of Pharmacophore points)
         num_ = sample_probability(num, num_p, 1)
-    elif name == 'geom':
+    else: # geom, plinder or others :)
         num = [3, 4, 5, 6, 7]
         num_p = [0.086, 0.0864, 0.389, 0.495, 0.0273]  # P(Number of Pharmacophore points)
         num_ = sample_probability(num, num_p, 1)

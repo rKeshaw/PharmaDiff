@@ -68,8 +68,11 @@ def plot_save_molecule(mol, save_path, conformer2d=None):
     dir_path = os.path.dirname(real_path)
     try:        # This normally works but sometimes randomly crashes
         font = ImageFont.truetype(os.path.join(dir_path, "Arial.ttf"), 15)
-    except OSError:
-        font = ImageFont.load_default()
+    except (OSError, IOError):
+        try:
+            font = ImageFont.load_default(size=15)
+        except TypeError:
+            font = ImageFont.load_default()
     draw.text((100, 15), f"3D view. Diam={max_dist:.1f}", font=font, fill='black')
     draw.text((420, 15), "2D view", font=font, fill='black')
     new_im.save(save_path, "PNG")
@@ -120,7 +123,18 @@ def visualize_chains(path, chain, atom_decoder, num_nodes):
 
         # Extract the positions of the final 2d molecule
         last_mol = mols[-1].rdkit_mol
-        AllChem.Compute2DCoords(last_mol)
+        try:
+            # Update property cache to calculate implicit valences
+            last_mol.UpdatePropertyCache(strict=False)
+            AllChem.Compute2DCoords(last_mol)
+        except (RuntimeError, ValueError) as e:
+            print(f"Warning: Could not compute 2D coords for chain {i}: {e}")
+            # Fallback: use 3D positions as 2D
+            conformer2d = torch.zeros((last_mol.GetNumAtoms(), 3))
+            for k in range(last_mol.GetNumAtoms()):
+                conformer2d[k] = mols[-1].positions[k]
+            # Skip to next iteration
+            continue
         coords = []
         conf = last_mol.GetConformer()
         for k, atom in enumerate(last_mol.GetAtoms()):
@@ -128,18 +142,22 @@ def visualize_chains(path, chain, atom_decoder, num_nodes):
             coords.append([p.x, p.y, p.z])
         conformer2d = torch.Tensor(coords)
 
-        for frame in range(len(mols)):
-            all_file_paths = visualize(result_path, mols, num_molecules_to_visualize=-1, log=None,
-                                       conformer2d=conformer2d, file_prefix='frame')
-
-
+        all_file_paths = visualize(result_path, mols, num_molecules_to_visualize=-1, log=None,
+                                   conformer2d=conformer2d, file_prefix='frame')
 
         # Turn the frames into a gif
-        imgs = [imageio.v3.imread(fn) for fn in all_file_paths]
-        gif_path = os.path.join(os.path.dirname(path), f"{path.split('/')[-1]}_{i}.gif")
-        print(f'Saving the gif at {gif_path}.')
-        imgs.extend([imgs[-1]] * 10)
-        imageio.mimsave(gif_path, imgs, subrectangles=True, duration=200)
+        try:
+            imgs = [imageio.v3.imread(fn) for fn in all_file_paths]
+            gif_path = os.path.join(os.path.dirname(path), f"{path.split('/')[-1]}_{i}.gif")
+            print(f'Saving the gif at {gif_path}.')
+            imgs.extend([imgs[-1]] * 10)
+            imageio.v3.imwrite(gif_path, imgs, duration=200, loop=0)
+        except AttributeError:
+            imgs = [imageio.imread(fn) for fn in all_file_paths]
+            gif_path = os.path.join(os.path.dirname(path), f"{path.split('/')[-1]}_{i}.gif")
+            print(f'Saving the gif at {gif_path}.')
+            imgs.extend([imgs[-1]] * 10)
+            imageio.mimsave(gif_path, imgs, duration=0.2)
 
         if wandb.run:
             wandb.log({"chain": wandb.Video(gif_path, fps=5, format="gif")}, commit=True)
@@ -155,9 +173,10 @@ def visualize_chains(path, chain, atom_decoder, num_nodes):
 
 
 def plot_molecule3d(ax, positions, atom_types, edge_types, alpha, hex_bg_color, num_atom_types):
-    x = positions[:, 0]
-    y = positions[:, 1]
-    z = positions[:, 2]
+    # Convert tensors to numpy ONCE before the loop to avoid repeated GPU->CPU transfers
+    x = positions[:, 0].cpu().numpy()
+    y = positions[:, 1].cpu().numpy()
+    z = positions[:, 2].cpu().numpy()
 
     # Normalize the positions for plotting
     max_x_dist = x.max() - x.min()
@@ -189,12 +208,12 @@ def plot_molecule3d(ax, positions, atom_types, edge_types, alpha, hex_bg_color, 
         for j in range(i + 1, edge_types.shape[1]):
             draw_edge = edge_types[i, j]
             if draw_edge > 0:
-                ax.plot([x[i].cpu().numpy(), x[j].cpu().numpy()],
-                        [y[i].cpu().numpy(), y[j].cpu().numpy()],
-                        [z[i].cpu().numpy(), z[j].cpu().numpy()],
+                ax.plot([x[i], x[j]],
+                        [y[i], y[j]],
+                        [z[i], z[j]],
                         linewidth=1, c=hex_bg_color, alpha=alpha)
 
-    ax.scatter(x.cpu().numpy(), y.cpu().numpy(), z.cpu().numpy(), s=areas, alpha=0.9 * alpha, c=colors)
+    ax.scatter(x, y, z, s=areas, alpha=0.9 * alpha, c=colors)
     return max_dist
 
 
@@ -209,7 +228,6 @@ def generatePIL3d(mol, buffer, bg='white', alpha=1.):
 
     fig = plt.figure(figsize=(3, 3))
     ax = fig.add_subplot(projection='3d')
-    ax.set_aspect('equal', adjustable='datalim')
     ax.view_init(elev=90, azim=-90)
     if bg == 'black':
         ax.set_facecolor(black)
@@ -221,9 +239,9 @@ def generatePIL3d(mol, buffer, bg='white', alpha=1.):
     ax._axis3don = False
 
     if bg == 'black':
-        ax.w_xaxis.line.set_color("black")
+        ax.xaxis.line.set_color("black")
     else:
-        ax.w_xaxis.line.set_color("white")
+        ax.xaxis.line.set_color("white")
 
     # max_value = positions.abs().max().item()
     axis_lim = 0.7

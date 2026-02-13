@@ -259,10 +259,8 @@ class NoiseModel:
         bs, n_max = node_mask.shape
         num_rows = data.X.size(0)
         if sample_condition is None:
-            # Select a random index using PyTorch
             random_indices = torch.randint(0, num_rows, (bs,))
         
-            # Access the corresponding row
             pharma_coord = data.pharma_coord[random_indices]
             pharma_feat = data.pharma_feat[random_indices]
             pharma_mask = data.pharma_mask[random_indices]
@@ -328,7 +326,6 @@ class NoiseModel:
         U_E = F.one_hot(U_E, num_classes=e_limit.shape[-1]).float()
         U_c = F.one_hot(U_c, num_classes=charges_limit.shape[-1]).float()
 
-        # Get upper triangular part of edge noise, without main diagonal
         upper_triangular_mask = torch.zeros_like(U_E)
         indices = torch.triu_indices(row=U_E.size(1), col=U_E.size(2), offset=1)
         upper_triangular_mask[:, indices[0], indices[1], :] = 1
@@ -357,12 +354,11 @@ class NoiseModel:
         node_mask = z_t.node_mask
         t_int = z_t.t_int
 
-        # Retrieve transitions matrix
+        # transitions matrix
         Qtb = self.get_Qt_bar(t_int=t_int)
         Qsb = self.get_Qt_bar(t_int=s_int)
         Qt = self.get_Qt(t_int)
 
-        # # Sample the positions
         sigma_sq_ratio = self.get_sigma_pos_sq_ratio(s_int=s_int, t_int=t_int)
         z_t_prefactor = (self.get_alpha_pos_ts(t_int=t_int, s_int=s_int) * sigma_sq_ratio).unsqueeze(-1)
         x_prefactor = self.get_x_pos_prefactor(s_int=s_int, t_int=t_int).unsqueeze(-1)

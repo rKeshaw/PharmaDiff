@@ -19,7 +19,6 @@ def train_affinity_predictor(
     use_precomputed: bool,
     precomputed_root: str,
 ):
-    # 1. Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if use_precomputed:
         dataset = PlinderPrecomputedDataset(split="train", root=precomputed_root)
@@ -51,9 +50,7 @@ def train_affinity_predictor(
         prefetch_factor=2 if num_workers > 0 else None,
     )
     
-    # 2. Models
     model = TimeAwareAffinityPredictor().to(device)
-    # We need the noise scheduler to generate training samples
     config_dir = Path(__file__).resolve().parents[2] / "configs"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = compose(config_name="config", overrides=["dataset=plinder"])
@@ -63,7 +60,6 @@ def train_affinity_predictor(
     affinity_loss_fn = torch.nn.MSELoss()
     ifp_loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
 
-    # 3. Training Loop
     model.train()
     for epoch in range(epochs):
         total_loss = 0
@@ -73,7 +69,6 @@ def train_affinity_predictor(
                 continue
             optimizer.zero_grad()
             
-            # A. Prepare Data
             lig_pos_clean = batch['ligand'].pos.to(device)
             lig_feat = batch['ligand'].x.to(device)
             prot_pos = batch['pocket_pos'].to(device)
@@ -82,12 +77,9 @@ def train_affinity_predictor(
             lig_batch_idx = batch['ligand'].batch.to(device)
             prot_batch_idx = batch['pocket_batch'].to(device)
             
-            # B. Sample Timesteps (t)
             batch_size = batch['ligand'].num_graphs
             t = torch.randint(0, noise_scheduler.T, (batch_size,), device=device).long()
             
-            # C. Add Noise (The Critical Step)
-            # We corrupt the clean ligand positions to simulate diffusion steps
             noise = torch.randn_like(lig_pos_clean)
             alpha_bars = noise_scheduler.get_alpha_bar(t_int=t, key='p')
             sqrt_alpha = torch.sqrt(alpha_bars).clamp(min=1e-6)
@@ -99,7 +91,6 @@ def train_affinity_predictor(
             num_types = model.lig_emb.in_features
             lig_feat_one_hot = F.one_hot(lig_feat, num_classes=num_types).float()
             
-            # D. Predict Affinity from NOISY structure
             pred_out = model(
                 lig_pos_noisy,
                 lig_feat_one_hot,
@@ -112,9 +103,6 @@ def train_affinity_predictor(
             pred_affinity = pred_out["affinity"]
             pred_ifp_logits = pred_out["ifp_logits"]
             
-            # E. Loss
-            # We want the model to predict the TRUE affinity even from noisy structures
-            # This teaches it the "gradient direction" towards the clean, high-affinity state
             loss_affinity = affinity_loss_fn(pred_affinity, true_affinity)
 
             if "plip_labels" in batch and "plip_label_mask" in batch:
@@ -135,7 +123,6 @@ def train_affinity_predictor(
             
         print(f"Epoch {epoch}: Loss {total_loss / len(loader)}")
         
-        # Save Checkpoint
         torch.save(model.state_dict(), "affinity_compass.pt")
 
 if __name__ == "__main__":

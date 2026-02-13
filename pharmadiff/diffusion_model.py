@@ -67,18 +67,15 @@ class FullDenoisingDiffusion(pl.LightningModule):
             protein_in_dim=8 # Pocket features from PLINDER encoder
         )
 
-        # Train metrics
         self.train_loss = TrainLoss(lambda_train=self.cfg.model.lambda_train
                                      if hasattr(self.cfg.model, "lambda_train") else self.cfg.train.lambda0)
         self.train_metrics = TrainMolecularMetrics(dataset_infos)
 
-        # Val Metrics
         self.val_metrics = torchmetrics.MetricCollection([custom_metrics.PosMSE(), custom_metrics.XKl(),
                                                           custom_metrics.ChargesKl(), custom_metrics.EKl()])
         self.val_nll = NLL()
         self.val_sampling_metrics = SamplingMetrics(train_smiles, dataset_infos, test=False)
 
-        # Test metrics
         self.test_metrics = torchmetrics.MetricCollection([custom_metrics.PosMSE(), custom_metrics.XKl(),
                                                            custom_metrics.ChargesKl(), custom_metrics.EKl()])
         self.test_nll = NLL()
@@ -132,8 +129,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
             print(f"Loading Affinity Model from {cfg.model.affinity_weight_path}")
             state_dict = torch.load(cfg.model.affinity_weight_path)
             self.affinity_model.load_state_dict(state_dict)
-            self.affinity_model.eval() # Keep frozen during generation
-            self.affinity_model.requires_grad_(False) # Standard freeze
+            self.affinity_model.eval() 
+            self.affinity_model.requires_grad_(False) 
 
         self.log_every_steps = cfg.general.log_every_steps
         self.number_chain_steps = cfg.general.number_chain_steps
@@ -143,6 +140,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.test_sampling_num_per_graph = cfg.general.test_sampling_num_per_graph
         
     def training_step(self, data, i):
+        if data is None:
+            print(f"[Warning] Training batch {i} is None (all samples failed loading). Skipping.")
+            return None
+        
         if data['ligand'].edge_index.numel() == 0:
             print("Found a batch with no edges. Skipping.")
             return
@@ -173,6 +174,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.val_metrics.reset()
 
     def validation_step(self, data, i):
+        if data is None:
+            return None
         dense_data = utils.to_dense(data, self.dataset_infos)
         self.val_dense_data = dense_data
         z_t = self.noise_model.apply_noise(dense_data)
@@ -199,7 +202,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
         print_str = ''.join(print_str)
         print(f"Epoch {self.current_epoch}: {print_str}."[:-4])
 
-        # Log val nll with default Lightning logger, so it can be monitored by checkpoint callback
         val_nll = metrics[0]
         self.log("val/epoch_NLL", val_nll, sync_dist=True)
 
@@ -230,6 +232,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.test_metrics.reset()
 
     def test_step(self, data, i):
+        if data is None:
+            return None
         dense_data = utils.to_dense(data, self.dataset_infos)
         self.test_dense_data = dense_data
         z_t = self.noise_model.apply_noise(dense_data)
@@ -397,17 +401,13 @@ class FullDenoisingDiffusion(pl.LightningModule):
         print(f"Test ends.")
 
     def kl_prior(self, clean_data, node_mask):
-        """Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
-
-        This is essentially a lot of work for something that is in practice negligible in the loss. However, you
-        compute it so that you see it when you've made a mistake in your noise schedule.
         """
-        # Compute the last alpha value, alpha_T.
+        Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
+        """
         ones = torch.ones((clean_data.X.size(0), 1), dtype=torch.long, device=clean_data.X.device)
         Ts = self.T * ones
         Qtb = self.noise_model.get_Qt_bar(t_int=Ts)
 
-        # Compute transition probabilities
         probX = clean_data.X @ Qtb.X + 1e-7  # (bs, n, dx_out)
         probE = clean_data.E @ Qtb.E.unsqueeze(1) + 1e-7  # (bs, n, n, de_out)
         probc = clean_data.charges @ Qtb.charges + 1e-7
@@ -419,7 +419,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
         bs, n, _ = probX.shape
         limit_dist = self.noise_model.get_limit_dist().device_as(probX)
 
-        # Set masked rows , so it doesn't contribute to loss
         probX[~node_mask] = limit_dist.X.float()
         probc[~node_mask] = limit_dist.charges.float()
         diag_mask = ~torch.eye(node_mask.size(1), device=node_mask.device, dtype=torch.bool).unsqueeze(0)
@@ -429,7 +428,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
         kl_distance_E = F.kl_div(input=probE.log(), target=limit_dist.E[None, None, None, :], reduction='none')
         kl_distance_c = F.kl_div(input=probc.log(), target=limit_dist.charges[None, None, :], reduction='none')
 
-        # Compute the kl on the positions
         last = self.T * torch.ones((bs, 1), device=clean_data.pos.device, dtype=torch.long)
         mu_T = self.noise_model.get_alpha_bar(t_int=last, key='p')[:, :, None] * clean_data.pos
         sigma_T = self.noise_model.get_sigma_bar(t_int=last, key='p')[:, :, None]
@@ -439,7 +437,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 sum_except_batch(kl_distance_pos))
 
     def compute_Lt(self, clean_data, pred, z_t, s_int, node_mask, test):
-        # TODO: ideally all probabilities should be computed in log space
         t_int = z_t.t_int
         pred = utils.PlaceHolder(X=F.softmax(pred.X, dim=-1), charges=F.softmax(pred.charges, dim=-1),
                                  E=F.softmax(pred.E, dim=-1), pos=pred.pos, node_mask=clean_data.node_mask, y=None, 
@@ -451,7 +448,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
         Qsb = self.noise_model.get_Qt_bar(s_int)
         Qt = self.noise_model.get_Qt(t_int)
 
-        # Compute distributions to compare with KL
         bs, n, d = clean_data.X.shape
         prob_true = diffusion_utils.posterior_distributions(clean_data=clean_data, noisy_data=z_t,
                                                             Qt=Qt, Qsb=Qsb, Qtb=Qtb)
@@ -460,11 +456,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                                             Qt=Qt, Qsb=Qsb, Qtb=Qtb)
         prob_pred.E = prob_pred.E.reshape((bs, n, n, -1))
 
-        # Reshape and filter masked rows
         prob_true = diffusion_utils.mask_distributions(prob_true, node_mask)
         prob_pred = diffusion_utils.mask_distributions(prob_pred, node_mask)
 
-        # Compute the prefactor for KL on the positions
         nm = self.noise_model
         prefactor = ((nm.get_alpha_bar(t_int=s_int, key='p') / (nm.get_sigma_bar(t_int=s_int, key='p') + 1e-6)) ** 2 -
                      (nm.get_alpha_bar(t_int=t_int, key='p') / (nm.get_sigma_bar(t_int=t_int, key='p') + 1e-6)) ** 2)
@@ -488,19 +482,14 @@ class FullDenoisingDiffusion(pl.LightningModule):
         t_int = z_t.t_int
         s_int = t_int - 1
 
-        # 1.
         N = node_mask.sum(1).long()
         log_pN = self.node_dist.log_prob(N)
 
-        # 2. The KL between q(z_T | x) and p(z_T) = Uniform(1/num_classes). Should be close to zero.
         kl_prior = self.kl_prior(clean_data, node_mask)
 
-        # 3. Diffusion loss
         loss_all_t = self.compute_Lt(clean_data, pred, z_t, s_int, node_mask, test)
 
-        # Combine terms
         nlls = - log_pN + kl_prior + loss_all_t
-        # Update NLL metric object and return batch nll
         nll = (self.test_nll if test else self.val_nll)(nlls)        # Average over the batch
 
         log_dict = {"kl prior": kl_prior.mean(),
@@ -527,10 +516,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
         n_nodes = torch.Tensor(n_nodes).long().to(self.device)
         batch_size = len(n_nodes)
         n_max = torch.max(n_nodes).item()
-        # Build the masks
         arange = torch.arange(n_max, device=self.device).unsqueeze(0).expand(batch_size, -1)
         node_mask = arange < n_nodes.unsqueeze(1)
-        # Sample noise  -- z has size (n_samples, n_nodes, n_features)
         z_T = self.noise_model.sample_limit_dist(data, node_mask=node_mask, sample_condition=sample_condition, n_nodes=n_nodes)
         
 
@@ -559,7 +546,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
             step_g_scale = self._scheduled_guidance_scale(g_scale, z_t)
             z_s = self.sample_zs_from_zt(z_t=z_t, s_int=s_array, sample_condition=sample_condition, guidance_scale=step_g_scale)
 
-            # Save the first keep_chain graphs
             if s_int != 0 and (s_int * number_chain_steps) % self.T == 0:
                 write_index = number_chain_steps - 1 - ((s_int * number_chain_steps) // self.T)
                 discrete_z_s = z_s.collapse(self.dataset_infos.collapse_charges)
@@ -655,7 +641,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
             molecule_list.append(mol)
 
               
-        # Visualize chains
         if keep_chain > 0:
             self.print('Batch sampled. Visualizing chains starts!')
             chains_path = os.path.join(os.getcwd(), f'chains/epoch{self.current_epoch}/',
@@ -669,7 +654,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
         if save_final > 0:
             self.print(f'Visualizing {save_final} individual molecules...')
 
-        # Visualize the final molecules
         current_path = os.getcwd()
         result_path = os.path.join(current_path, f'graphs/epoch{self.current_epoch}_b{batch_id}/')
         _ = visualizer.visualize(result_path, molecule_list, num_molecules_to_visualize=save_final)
@@ -713,29 +697,24 @@ class FullDenoisingDiffusion(pl.LightningModule):
         Samples zs ~ p(zs | zt) with Affinity Guidance.
         Implements Diffleop-style guidance for both Continuous (Pos) and Discrete (Type) data.
         """
-        # 1. Standard Prediction from the Generative Model
         extra_data = self.extra_features(z_t)
         pred = self.forward(z_t, extra_data)
 
-        # 2. Prepare for Guidance Calculation
-        # We need gradients, so we must enable grad on inputs even during inference
         with torch.enable_grad():
-            # A. Continuous State (Positions)
             z_t_pos = z_t.pos.detach().clone().requires_grad_(True)
-            
-            # B. Discrete State (Atom Types & Edges) - Convert to Soft One-Hot
-            # This allows us to get gradients w.r.t "changing an atom type"
-            # z_t.X is indices (B, N). Convert to (B, N, num_types)
-            n_atom_types = self.dataset_infos.input_dims.X
-            z_t_X_hot = F.one_hot(z_t.X, num_classes=n_atom_types).float().detach().requires_grad_(True)
-            
-            # 3. Calculate Affinity Gradients
-            # Only run if guidance is active and we have a pocket condition
+
+            if z_t.X.dim() == 3:
+                # Already One-Hot (B, N, C) - Use as is
+                z_t_X_hot = z_t.X.detach().clone().requires_grad_(True)
+            else:
+                # Indices (B, N) - Convert to One-Hot
+                n_atom_types = self.dataset_infos.input_dims.X
+                z_t_X_hot = F.one_hot(z_t.X.long(), num_classes=n_atom_types).float().detach().requires_grad_(True)
+
             grad_pos = torch.zeros_like(z_t_pos)
             grad_X = torch.zeros_like(z_t_X_hot)
             
             if (self.affinity_model is not None and sample_condition is not None and guidance_scale > 0):
-                # Ensemble Affinity Gradients
                 n_ensemble = 3
                 accumulated_grad_pos = torch.zeros_like(z_t_pos)
                 accumulated_grad_X = torch.zeros_like(z_t_X_hot)
@@ -743,7 +722,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 pharma_scale = getattr(self.cfg.general, "pharma_guidance_scale", 0.1)
 
                 for _ in range(n_ensemble):
-                    # Predict affinity
                     pred_out = self.affinity_model(
                         lig_pos=z_t_pos, lig_feat=z_t_X_hot,
                         prot_pos=sample_condition.pocket_pos,
@@ -787,7 +765,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
 
                     total_obj = predicted_affinity.sum() + ifp_scale * ifp_obj + pharma_scale * pharma_obj
 
-                    # Compute Gradients (Maximize Affinity)
                     grads = torch.autograd.grad(total_obj, [z_t_pos, z_t_X_hot], retain_graph=True)
                     accumulated_grad_pos += grads[0] / n_ensemble
                     accumulated_grad_X += grads[1] / n_ensemble                
@@ -799,87 +776,78 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 # grad_clash = self.calculate_clash_gradient(z_t_pos, sample_condition.pocket_pos)
                 # grad_pos = grad_pos - (grad_clash * 2.0) # Penalize clashes
 
-        # 4. Compute Diffusion Parameters for the Step
-        # We need these to calculate the Variance for scaling
         t_int = z_t.t_int
         Qtb = self.noise_model.get_Qt_bar(t_int)
         Qsb = self.noise_model.get_Qt_bar(s_int)
         Qt = self.noise_model.get_Qt(t_int)
         
-        # Calculate Variance (sigma_t_given_s) for Position Scaling
-        # Diffleop Eq 22: scale gradient by variance to avoid breaking structure at low t
-        gamma_t = self.noise_model.get_gamma_bar(t_int=t_int, key='p')
-        gamma_s = self.noise_model.get_gamma_bar(t_int=s_int, key='p')
+        gamma_t = self.noise_model.get_gamma(t_int=t_int, key='p')
+        gamma_s = self.noise_model.get_gamma(t_int=s_int, key='p')
         _, sigma_t_given_s, _ = diffusion_utils.sigma_and_alpha_t_given_s(gamma_t, gamma_s, z_t.pos.shape)
+
+        z_s = self.noise_model.sample_zs_from_zt_and_pred(z_t=z_t, pred=pred, s_int=s_int)
+
+        if guidance_scale > 0:
+            variance_scale = sigma_t_given_s ** 2 
+            pos_shift = guidance_scale * variance_scale * grad_pos
+            z_s.pos = z_s.pos + pos_shift
         
-        # 5. Apply Guidance to POSITIONS (Continuous)
-        # Update Rule: mean = mean + s * variance * grad
-        # Retrieve the standard posterior mean first
+        pred_probs = pred.copy()
+        pred_probs.X = F.softmax(pred.X, dim=-1)
+        pred_probs.charges = F.softmax(pred.charges, dim=-1)
+        pred_probs.E = F.softmax(pred.E, dim=-1)
+
         prob_true = diffusion_utils.posterior_distributions(
-            clean_data=pred, 
+            clean_data=pred_probs, 
             noisy_data=z_t,
             Qt=Qt, Qsb=Qsb, Qtb=Qtb
         )
-        
-        # Calculate standard position mean (mu)
-        # Note: This logic mirrors the internal calculation in noise_model.sample_zs_from_zt_and_pred
-        # We reconstruct it here to inject guidance.
-        nm = self.noise_model
-        alpha_t_bar = nm.get_alpha_bar(t_int=t_int, key='p')
-        alpha_s_bar = nm.get_alpha_bar(t_int=s_int, key='p')
-        sigma_t_bar = nm.get_sigma_bar(t_int=t_int, key='p')
-        sigma_s_bar = nm.get_sigma_bar(t_int=s_int, key='p')
-        
-        # Standard Diffusion Posterior Mean Formula
-        # mu = (alpha_s_bar * (1 - alpha_t_bar**2) * z_0 + alpha_t_bar * (1 - alpha_s_bar**2) * z_t) / (1 - alpha_t_bar**2)
-        # Simplified using coefficients:
-        coeff1 = (alpha_s_bar * sigma_t_bar**2) / (sigma_t_bar**2) # Simplified
-        
-        z_s = self.noise_model.sample_zs_from_zt_and_pred(z_t=z_t, pred=pred, s_int=s_int)
-        
-        # Apply Position Guidance
-        # We modify the SAMPLED z_s directly, effectively shifting the mean
-        # Shift = scale * variance * gradient
-        variance_scale = sigma_t_given_s ** 2 
-        pos_shift = guidance_scale * variance_scale * grad_pos
-        z_s.pos = z_s.pos + pos_shift
 
-        # 6. Apply Guidance to ATOM TYPES (Discrete)
-        # Update Rule: log_prob = log_prob + scale * gradient
-        # Diffleop Eq 23
+        bs, n, _ = z_t.X.shape
+        if prob_true.E.dim() == 3:
+            # Reshape from (B, N*N, C) -> (B, N, N, C)
+            prob_true.E = prob_true.E.reshape(bs, n, n, -1)
         
         # 'prob_true.X' contains the posterior probabilities p(x_s | x_t, x_0)
         # Shape: (B, N, n_types)
         posterior_probs_X = prob_true.X
         
-        # Convert to logits to add gradient safely
-        posterior_logits_X = torch.log(posterior_probs_X + 1e-10)
+        if guidance_scale > 0:
+            posterior_logits_X = torch.log(posterior_probs_X + 1e-10)
+            posterior_logits_X = posterior_logits_X + (guidance_scale * grad_X)
+            posterior_probs_X = F.softmax(posterior_logits_X, dim=-1)
         
-        # Add Guidance
-        # gradient tells us which type increases affinity
-        posterior_logits_X = posterior_logits_X + (guidance_scale * grad_X)
-        
-        # Renormalize to get valid probabilities
-        new_probs_X = F.softmax(posterior_logits_X, dim=-1)
-        
-        # Re-Sample Discrete States using new probabilities
-        # We rely on diffusion_utils to handle the masking and sampling details
         z_s_discrete = diffusion_utils.sample_discrete_features(
-            probX=new_probs_X,
-            probE=prob_true.E, # We didn't guide edges, but could similarly
+            probX=posterior_probs_X,
+            probE=prob_true.E, 
             prob_charges=prob_true.charges,
             node_mask=z_t.node_mask
         )
         
-        # Update the return object with guided discrete choices
-        z_s.X = z_s_discrete.X
-        # (Edges and charges remain as sampled by default unless you guide them too)
+        z_s.X = F.one_hot(z_s_discrete.X, num_classes=self.output_dims.X).float()
+        z_s.charges = F.one_hot(z_s_discrete.charges, num_classes=self.output_dims.charges).float()
+        z_s.E = F.one_hot(z_s_discrete.E, num_classes=self.output_dims.E).float()
 
         return z_s
 
     def sample_n_graphs(self, data, samples_to_generate: int, chains_to_save: int, samples_to_save: int, test: bool, sample_condition: None):
         if samples_to_generate <= 0:
             return []
+        
+        if test and self.cfg.model.use_pocket_interaction:
+            if sample_condition is None:
+
+                print("[WARNING] No sample_condition provided for pocket-conditioned model. Using pocket from current test batch.")
+
+                from pharmadiff.utils import PlaceHolder
+                sample_condition = PlaceHolder(
+                    pocket_pos=data.pocket_pos,
+                    pocket_feat=data.pocket_feat,
+                    pocket_mask=getattr(data, 'pocket_mask', None), 
+                    pocket_batch=getattr(data, 'pocket_batch', None),
+                    ref_ligand_pos=data.pos, 
+                    ref_ligand_atom_types=torch.argmax(data.X, dim=-1)
+                )
 
         chains_left_to_save = chains_to_save
 
@@ -914,7 +882,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     current_max_size = potential_max_size
                 else:
                     chains_save = max(min(chains_left_to_save, len(current_n_list)), 0)
-                    samples.extend(self.sample_batch(data, n_nodes=current_n_list, data=data, batch_id=i,
+                    samples.extend(self.sample_batch(data, n_nodes=current_n_list, batch_id=i,
                                                      save_final=len(current_n_list), keep_chain=chains_save,
                                                      number_chain_steps=self.number_chain_steps, test=test, 
                                                      sample_condition=sample_condition))
@@ -1052,7 +1020,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.train_metrics.reset()
 
     def on_fit_start(self) -> None:
-        self.train_iterations = 100      # TODO: fix -- previously was len(self.trainer.datamodule.train_dataloader())
+        self.train_iterations = 100      
         if self.local_rank == 0:
             utils.setup_wandb(self.cfg)
 
