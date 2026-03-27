@@ -2,7 +2,7 @@
 general:
     name : 'noh_ada3'
     gpus : 1
-    wandb: 'online'
+    wandb: 'disabled'
     test_only: null
     resume: null
     evaluate_all_checkpoints: False
@@ -12,8 +12,8 @@ general:
     num_final_sampling: 1
     test_sampling_num_per_graph: 1
 train:
-    n_epochs: 1500
-    batch_size: 1024
+    n_epochs: 10
+    batch_size: 512
     save_model: True
     num_workers: 4
     lr: 0.0001

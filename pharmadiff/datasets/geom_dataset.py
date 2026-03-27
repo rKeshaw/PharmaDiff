@@ -39,7 +39,7 @@ class GeomDrugsDataset(InMemoryDataset):
             self.atom_encoder = {k: v - 1 for k, v in self.atom_encoder.items() if k != 'H'}
 
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.full_data_dict = torch.load(self.processed_paths[0])
+        self.full_data_dict = torch.load(self.processed_paths[0], weights_only=False)
         
         
         self.ligand = self.full_data_dict['ligand']

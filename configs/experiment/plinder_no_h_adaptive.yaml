@@ -1,0 +1,69 @@
+# configs/experiment/plinder_no_h_adaptive.yaml
+# @package _global_
+#
+# Experiment config for PLINDER training.
+# Differences from geom_no_h_adaptive.yaml:
+#
+#   n_epochs: 2000 (vs 1000)
+#     PLINDER train set is ~5-10x smaller than GEOM after quality filtering.
+#     More epochs needed to see equivalent molecular diversity. Each epoch
+#     is faster (fewer batches), so wall-clock time is comparable.
+#
+#   lambda_train[1] (atom X loss): 0.6 (vs 0.4)
+#     PLINDER has different atom type distribution after cofactor removal.
+#     Slightly higher weight improves atom identity learning.
+#
+#   lambda_train[3] (edge E loss): 4 (vs 3)
+#     Crystal-pose bonds are well-defined. Higher weight helps bond topology.
+#
+#   lambda_train[5] (pharma pos loss): 3.0 (vs 2.5)
+#     Pharmacophore positions from true binding poses are reliable anchors.
+#
+#   All other values unchanged — same architecture as GEOM.
+
+general:
+    name: 'plinder-no-h-adaptive'
+    gpus: 1
+    wandb: 'offline'
+    test_only: null
+    evaluate_all_checkpoints: False
+
+    sample_every_val: 50
+    samples_to_generate: 64
+    samples_to_save: 10
+    chains_to_save: 1
+
+    final_model_samples_to_generate: 250
+    final_model_samples_to_save: 0
+    final_model_chains_to_save: 0
+    num_final_sampling: 1
+    test_sampling_num_per_graph: 1000
+
+    check_val_every_n_epochs: 1
+    log_every_steps: 2
+    number_chain_steps: 50
+    faster_sampling: 1
+
+train:
+    n_epochs: 500
+    batch_size: 350
+    reference_batch_size: 350
+    save_model: True
+
+model:
+    n_layers: 12
+    lambda_train: [5, 0.6, 1, 4, 0, 3.0, 0.2, 0.5]
+    nu:
+      p: 2.5
+      x: 1
+      c: 1
+      e: 1.5
+      y: 1
+
+dataset:
+    name: 'plinder'
+    datadir: 'data/plinder/'
+    remove_h: True
+    random_subset: null
+    pin_memory: True
+    adaptive_loader: True

@@ -2,7 +2,7 @@
 general:
     name : 'geom-no-h-adaptive-sampling'
     gpus : 1
-    wandb: 'online'
+    wandb: 'disabled'
     test_only: null
     evaluate_all_checkpoints: False
     final_model_samples_to_generate: 250
@@ -11,8 +11,8 @@ general:
     num_final_sampling: 1
     test_sampling_num_per_graph: 1000
 train:
-    n_epochs: 1000
-    batch_size: 350
+    n_epochs: 10
+    batch_size: 256
     reference_batch_size: 350
     save_model: True
 model:

@@ -1,0 +1,6 @@
+name: 'plinder'
+datadir: 'data/plinder/'
+remove_h: True
+random_subset: null
+pin_memory: True
+adaptive_loader: True

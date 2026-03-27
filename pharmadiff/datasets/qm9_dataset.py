@@ -60,7 +60,7 @@ class QM9Dataset(InMemoryDataset):
             self.atom_encoder = {k: v - 1 for k, v in self.atom_encoder.items() if k != 'H'}
 
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.full_data_dict = torch.load(self.processed_paths[0])
+        self.full_data_dict = torch.load(self.processed_paths[0], weights_only=False)
         
         self.ligand = self.full_data_dict['ligand']
         self.pharmacophore = self.full_data_dict['pharmacophore']
@@ -166,19 +166,21 @@ class QM9Dataset(InMemoryDataset):
         for i, mol in enumerate(tqdm(suppl)):
             if i in skip or i not in target_df.index:
                 continue
+            if mol is None:
+                num_errors += 1
+                continue
+            try:
+                Chem.SanitizeMol(mol)
+                Chem.Kekulize(mol)
+            except Exception as e:
+                num_errors += 1
+                continue
             smiles = Chem.MolToSmiles(mol, isomericSmiles=False)
             if smiles is None:
                 num_errors += 1
                 continue
             else:
                 all_smiles.append(smiles)
-            try:
-                Chem.SanitizeMol(mol)
-                Chem.Kekulize(mol)
-               
-            except Exception as e:
-                print(e)
-                continue    
             data, pos_mean = mol_to_torch_geometric(mol, full_atom_encoder, smiles)
             pharmacophore = mol_to_torch_pharmacophore(mol, pos_mean, name=self.name)
             if pharmacophore is None:

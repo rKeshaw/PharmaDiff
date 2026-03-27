@@ -15,7 +15,7 @@ from torch.utils.data import Subset
 from torch_geometric.loader.dataloader import DataLoader
 
 
-from pharmadiff.datasets import qm9_dataset, geom_dataset
+from pharmadiff.datasets import qm9_dataset, geom_dataset, plinder_dataset
 from pharmadiff.diffusion_model import FullDenoisingDiffusion
 
 import random
@@ -39,14 +39,18 @@ def main(cfg: omegaconf.DictConfig):
     dataset_config = cfg.dataset
     pl.seed_everything(cfg.train.seed)
 
-    if dataset_config.name in ['qm9', "geom"]:
+    if dataset_config.name in ['qm9', "geom", "plinder"]:
         if dataset_config.name == 'qm9':
             datamodule = qm9_dataset.QM9DataModule(cfg)
             dataset_infos = qm9_dataset.QM9infos(datamodule=datamodule, cfg=cfg)
 
-        else:
+        elif dataset_config.name == 'geom':
             datamodule = geom_dataset.GeomDataModule(cfg)
             dataset_infos = geom_dataset.GeomInfos(datamodule=datamodule, cfg=cfg)
+
+        else:
+            datamodule = plinder_dataset.PlinderDataModule(cfg)
+            dataset_infos = plinder_dataset.PlinderInfos(datamodule=datamodule, cfg=cfg)
 
         train_smiles = list(datamodule.train_dataloader().dataset.smiles) if cfg.general.test_only else []
 

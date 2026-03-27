@@ -119,12 +119,16 @@ class SamplingMetrics(nn.Module):
                     error_message[3] += 1
         print(f"Error messages: AtomValence {error_message[1]}, Kekulize {error_message[2]}, other {error_message[3]}, "
               f" -- No error {error_message[-1]}")
-        self.validity_metric.update(value=len(valid) / len(generated), weight=len(generated))
+        if len(generated):
+            self.validity_metric.update(value=len(valid) / len(generated), weight=len(generated))
         num_components = torch.tensor(num_components, device=self.mean_components.device)
         self.mean_components.update(num_components)
         self.max_components.update(num_components)
-        not_connected = 100.0 * error_message[4] / len(generated)
-        connected_components = 100.0 - not_connected
+        if len(generated):
+            not_connected = 100.0 * error_message[4] / len(generated)
+            connected_components = 100.0 - not_connected
+        else:
+            connected_components = 0
         return valid, valid_rdkit_mols, valid_mols, connected_components, all_smiles, error_message
 
 
@@ -374,8 +378,8 @@ class SamplingMetrics(nn.Module):
         print(f"length_counts: {length_counts}")
         satisfied_percentage = [i for i in satisfied_percentage if i >= 0]
         
-        
-        self.rdkit_pharma_match.update(value= sum(satisfied_percentage) /len(satisfied_percentage),
+        if len(satisfied_percentage):
+            self.rdkit_pharma_match.update(value= sum(satisfied_percentage) /len(satisfied_percentage),
                                   weight=len(satisfied_percentage))
 
     def rdkit_valid_pharma_satisfaction(self, valid_molecules, valid_rdkit_mols):
@@ -485,12 +489,18 @@ class SamplingMetrics(nn.Module):
         pass_2d_filter = [i for i in pass_2d_filter if i >= 0] 
         number_rings = [i for i in number_rings if i >= 0]       
 
-        self.rdkit_SAS.update(value= sum(sas) /len(sas), weight=len(sas))
-        self.rdkit_QED.update(value= sum(qeds) /len(qeds), weight=len(qeds))
-        self.pass_2d_filter.update(value= sum(pass_2d_filter) /len(pass_2d_filter), weight=len(pass_2d_filter))
-        self.ring_filter.update(value= sum(ring_filter) /len(ring_filter), weight=len(ring_filter))
-        self.pains_filter.update(value= sum(pains_filter) /len(pains_filter), weight=len(pains_filter))
-        self.n_rings.update(value= sum(number_rings) /len(number_rings), weight=len(number_rings))
+        if len(sas):
+            self.rdkit_SAS.update(value= sum(sas) /len(sas), weight=len(sas))
+        if len(qeds):   
+            self.rdkit_QED.update(value= sum(qeds) /len(qeds), weight=len(qeds))
+        if len(pass_2d_filter):
+            self.pass_2d_filter.update(value= sum(pass_2d_filter) /len(pass_2d_filter), weight=len(pass_2d_filter))
+        if len(ring_filter):
+            self.ring_filter.update(value= sum(ring_filter) /len(ring_filter), weight=len(ring_filter))
+        if len(pains_filter):
+            self.pains_filter.update(value= sum(pains_filter) /len(pains_filter), weight=len(pains_filter))
+        if len(number_rings):
+            self.n_rings.update(value= sum(number_rings) /len(number_rings), weight=len(number_rings))
         
 
     def pgmg_match_score_fn(self, molecules):
@@ -524,13 +534,13 @@ class SamplingMetrics(nn.Module):
         
         above_0_8_count = sum(1 for score in satisfied_percentage if score >= 0.8)
         
-
-        self.pgmg_match_score.update(value= sum(satisfied_percentage) /len(satisfied_percentage),
-                                     weight=len(satisfied_percentage))
-        self.pgmg_percentage.update(value= satisfied_percentage.count(1) /len(satisfied_percentage), 
-                                    weight=len(satisfied_percentage))
-        self.pgmg_abobe_threshold.update(value= above_0_8_count /len(satisfied_percentage),
-                                         weight=len(satisfied_percentage))
+        if len(satisfied_percentage):
+            self.pgmg_match_score.update(value= sum(satisfied_percentage) /len(satisfied_percentage),
+                                        weight=len(satisfied_percentage))
+            self.pgmg_percentage.update(value= satisfied_percentage.count(1) /len(satisfied_percentage), 
+                                        weight=len(satisfied_percentage))
+            self.pgmg_abobe_threshold.update(value= above_0_8_count /len(satisfied_percentage),
+                                            weight=len(satisfied_percentage))
 
         
         
@@ -554,12 +564,12 @@ class SamplingMetrics(nn.Module):
         valid_match_score = [i for i in satisfied_percentage if i >= 0]
         above_0_8_count = sum(1 for score in satisfied_percentage if score >= 0.8)
         
-        
-        self.pgmg_valid_match_score.update(value= sum(valid_match_score) /len(valid_match_score),
-                                           weight=len(valid_match_score))
-        self.pgmg_valid_percentage.update(value= valid_match_score.count(1) /len(valid_match_score),
-                                          weight=len(valid_match_score))
-        self.pgmg_valid_above_threshold.update(value= above_0_8_count /len(valid_match_score),
+        if len(valid_match_score):
+            self.pgmg_valid_match_score.update(value= sum(valid_match_score) /len(valid_match_score),
+                                            weight=len(valid_match_score))
+            self.pgmg_valid_percentage.update(value= valid_match_score.count(1) /len(valid_match_score),
+                                            weight=len(valid_match_score))
+            self.pgmg_valid_above_threshold.update(value= above_0_8_count /len(valid_match_score),
                                               weight=len(valid_match_score))
         
     

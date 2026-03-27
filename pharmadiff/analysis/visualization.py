@@ -59,9 +59,8 @@ def plot_save_molecule(mol, save_path, conformer2d=None):
     try:
         pil2d = generatePIL2d(mol.rdkit_mol, conformer2d)
         new_im.paste(pil2d, (300, 0, 600, 300))
-    except ValueError:
-        print("Value error in generate PIL2D. The ")
-        return
+    except (ValueError, RuntimeError) as e:
+        print("Value error in generate PIL2D. Saving 3D view only.")
 
     draw = ImageDraw.Draw(new_im)
     real_path = os.path.realpath(__file__)
@@ -221,9 +220,9 @@ def generatePIL3d(mol, buffer, bg='white', alpha=1.):
     ax._axis3don = False
 
     if bg == 'black':
-        ax.w_xaxis.line.set_color("black")
+        ax.xaxis.line.set_color("black")
     else:
-        ax.w_xaxis.line.set_color("white")
+        ax.xaxis.line.set_color("white")
 
     # max_value = positions.abs().max().item()
     axis_lim = 0.7
