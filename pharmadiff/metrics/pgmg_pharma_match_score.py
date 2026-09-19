@@ -195,7 +195,9 @@ def max_match(mol, node_types, coordinates, phco, phar_mapping):
                     dist_dict[dist_name] = dist
 
     match_score_max = 0
-    for phco_elment_list in __iter_product(phco, list(phar_mapping)):
+    for perm_idx, phco_elment_list in enumerate(__iter_product(phco, list(phar_mapping))):
+        if perm_idx >= 2000:
+            break
 
         error_count = 0
         correct_count = 0

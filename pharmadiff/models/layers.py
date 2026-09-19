@@ -219,10 +219,13 @@ class EtoX(nn.Module):
 
 def masked_softmax(x, mask, **kwargs):
     if torch.sum(mask) == 0:
-        return x
+        return torch.zeros_like(x)
     x_masked = x.clone()
-    x_masked[mask == 0] = -float("inf")
-    return torch.softmax(x_masked, **kwargs)
+    x_masked[mask == 0] = -1e9
+    out = torch.softmax(x_masked, **kwargs)
+    out = out * mask
+    return torch.nan_to_num(out, nan=0.0)
+
 
 
 class SetNorm(nn.LayerNorm):

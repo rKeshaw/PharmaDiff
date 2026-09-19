@@ -53,6 +53,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from rdkit import Chem, RDLogger
 from tqdm import tqdm
@@ -206,14 +207,29 @@ def deduplicate_to_one_ligand_per_system(df: pd.DataFrame) -> pd.DataFrame:
 # Step 3 — SDF loading from extracted filesystem
 # ---------------------------------------------------------------------------
 
+def _find_system_dir(plinder_dir: Path, system_id: str) -> Optional[Path]:
+    """Resolves system directory whether stored flat or nested by two-char code."""
+    flat = plinder_dir / "systems" / system_id
+    if flat.is_dir():
+        return flat
+    pdb_id = system_id.split("__")[0].split("_")[0]
+    if len(pdb_id) >= 3:
+        two_char = pdb_id[1:3].lower()
+        nested = plinder_dir / "systems" / two_char / system_id
+        if nested.is_dir():
+            return nested
+    return None
+
+
 def _read_sdf(plinder_dir: Path, system_id: str, ligand_chain: str) -> Optional[str]:
     """
     Reads SDF from extracted filesystem.
-    Path: {plinder_dir}/systems/{system_id}/ligand_files/{ligand_chain}.sdf
+    Path: {plinder_dir}/systems/[{two_char}/]{system_id}/ligand_files/{ligand_chain}.sdf
     """
-    sdf_path = (
-        plinder_dir / "systems" / system_id / "ligand_files" / f"{ligand_chain}.sdf"
-    )
+    sys_dir = _find_system_dir(plinder_dir, system_id)
+    if sys_dir is None:
+        return None
+    sdf_path = sys_dir / "ligand_files" / f"{ligand_chain}.sdf"
     if not sdf_path.exists():
         return None
     try:
@@ -272,13 +288,105 @@ def _parse_mol(sdf_str: str) -> Optional[Chem.Mol]:
         return None
 
 
+STANDARD_AMINO_ACIDS = {
+    'ALA': 0, 'ARG': 1, 'ASN': 2, 'ASP': 3, 'CYS': 4,
+    'GLN': 5, 'GLU': 6, 'GLY': 7, 'HIS': 8, 'ILE': 9,
+    'LEU': 10, 'LYS': 11, 'MET': 12, 'PHE': 13, 'PRO': 14,
+    'SER': 15, 'THR': 16, 'TRP': 17, 'TYR': 18, 'VAL': 19
+}  # 20 is 'OTHER'
+
+
+def _extract_pocket(plinder_dir: Path, system_id: str, ligand_mol: Chem.Mol,
+                    cutoff: float = 8.0, max_atoms: int = 150) -> Optional[dict]:
+    """
+    Extracts pocket heavy atoms from receptor.pdb within `cutoff` Angstroms
+    of any ligand heavy atom.
+    Path: {plinder_dir}/systems/{system_id}/receptor.pdb
+    Returns:
+        {'pos': np.ndarray (M, 3), 'res_idx': np.ndarray (M,)} or None
+    """
+    sys_dir = _find_system_dir(plinder_dir, system_id)
+    if sys_dir is None:
+        return None
+    receptor_pdb = sys_dir / "receptor.pdb"
+    if not receptor_pdb.exists():
+        return None
+
+    try:
+        ligand_conf = ligand_mol.GetConformer()
+        lig_pos = ligand_conf.GetPositions()
+        heavy_indices = [a.GetIdx() for a in ligand_mol.GetAtoms() if a.GetAtomicNum() != 1]
+        if not heavy_indices:
+            return None
+        lig_heavy_pos = lig_pos[heavy_indices]
+
+        atom_coords = []
+        atom_res = []
+
+        with open(receptor_pdb, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("ATOM  "):
+                    res_name = line[17:20].strip()
+                    if res_name in {"HOH", "WAT", "H2O", "DOD", "SO4", "PO4", "ACT"}:
+                        continue
+                    element = line[76:78].strip().upper() if len(line) >= 78 else ""
+                    if not element:
+                        atom_name = line[12:16].strip()
+                        element = atom_name[0] if atom_name else "C"
+                    if element == "H":
+                        continue
+
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except ValueError:
+                        continue
+
+                    res_idx = STANDARD_AMINO_ACIDS.get(res_name, 20)
+                    atom_coords.append([x, y, z])
+                    atom_res.append(res_idx)
+
+        if not atom_coords:
+            return None
+
+        atom_coords = np.array(atom_coords, dtype=np.float32)
+        dists = np.linalg.norm(atom_coords[:, None, :] - lig_heavy_pos[None, :, :], axis=-1)
+        min_dists = dists.min(axis=1)
+
+        pocket_mask = min_dists <= cutoff
+        if not np.any(pocket_mask):
+            return None
+
+        selected_coords = atom_coords[pocket_mask]
+        selected_res = np.array(atom_res, dtype=np.int64)[pocket_mask]
+        selected_dists = min_dists[pocket_mask]
+
+        if len(selected_coords) > max_atoms:
+            sort_idx = np.argsort(selected_dists)[:max_atoms]
+            selected_coords = selected_coords[sort_idx]
+            selected_res = selected_res[sort_idx]
+
+        return {
+            "pos": selected_coords,
+            "res_idx": selected_res,
+        }
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Step 4 — Per-process worker
 # ---------------------------------------------------------------------------
 
-def _process_one(args: Tuple) -> Optional[Tuple[str, list]]:
-    """Returns (smiles, [mol_with_H]) or None."""
-    system_id, ligand_chain, smiles, plinder_dir_str = args
+def _process_one(args: Tuple) -> Optional[Tuple]:
+    """Returns (smiles, [mol_with_H], pocket_dict) or (smiles, [mol_with_H]) or None."""
+    if len(args) == 4:
+        system_id, ligand_chain, smiles, plinder_dir_str = args
+        extract_pocket, pocket_cutoff, max_pocket_atoms = True, 8.0, 150
+    else:
+        system_id, ligand_chain, smiles, plinder_dir_str, extract_pocket, pocket_cutoff, max_pocket_atoms = args
+
     plinder_dir = Path(plinder_dir_str)
 
     sdf_str = _read_sdf(plinder_dir, system_id, ligand_chain)
@@ -297,9 +405,12 @@ def _process_one(args: Tuple) -> Optional[Tuple[str, list]]:
     except Exception:
         return None
 
-    # GEOM-compatible format: (smiles, [mol])
-    # List wrapper matches GEOM's multi-conformer convention.
-    # PLINDER provides one conformer (crystal bound pose).
+    pocket = None
+    if extract_pocket:
+        pocket = _extract_pocket(plinder_dir, system_id, mol, cutoff=pocket_cutoff, max_atoms=max_pocket_atoms)
+
+    if pocket is not None:
+        return (smiles, [mol], pocket)
     return (smiles, [mol])
 
 
@@ -313,9 +424,17 @@ def process_split(
     n_workers: int,
     split_name: str,
     output_dir: Path,
+    extract_pocket: bool = True,
+    pocket_cutoff: float = 8.0,
+    max_pocket_atoms: int = 150,
 ) -> None:
+    systems_dir = plinder_dir / "systems"
+    if systems_dir.is_dir():
+        disk_systems = set(os.listdir(systems_dir))
+        df_split = df_split[df_split["system_id"].isin(disk_systems)].reset_index(drop=True)
+
     n = len(df_split)
-    log.info(f"[{split_name}] {n:,} systems | {n_workers} worker(s)")
+    log.info(f"[{split_name}] {n:,} systems on disk to process | {n_workers} worker(s) | extract_pocket={extract_pocket}")
 
     args_list = [
         (
@@ -323,6 +442,9 @@ def process_split(
             row["ligand_instance_chain"],
             row["ligand_rdkit_canonical_smiles"],
             str(plinder_dir),
+            extract_pocket,
+            pocket_cutoff,
+            max_pocket_atoms,
         )
         for _, row in df_split.iterrows()
     ]
@@ -389,6 +511,18 @@ def main() -> None:
         "--dry_run", action="store_true",
         help="Filter annotations and print statistics without loading any SDFs.",
     )
+    parser.add_argument(
+        "--no_pocket", action="store_true",
+        help="Disable pocket extraction (ligand-only mode).",
+    )
+    parser.add_argument(
+        "--pocket_cutoff", type=float, default=8.0,
+        help="Distance cutoff (Angstroms) from ligand heavy atoms to define pocket.",
+    )
+    parser.add_argument(
+        "--max_pocket_atoms", type=int, default=150,
+        help="Maximum pocket heavy atoms to retain per system.",
+    )
     args = parser.parse_args()
 
     plinder_dir = Path(args.plinder_dir).expanduser()
@@ -401,6 +535,8 @@ def main() -> None:
         log.info("Dry run complete — no files written.")
         return
 
+    extract_pocket = not args.no_pocket
+
     for split_name in args.splits:
         df_split = df[df["split"] == split_name].reset_index(drop=True)
         if len(df_split) == 0:
@@ -412,6 +548,9 @@ def main() -> None:
             n_workers=args.n_workers,
             split_name=split_name,
             output_dir=output_dir,
+            extract_pocket=extract_pocket,
+            pocket_cutoff=args.pocket_cutoff,
+            max_pocket_atoms=args.max_pocket_atoms,
         )
 
     log.info("Done. Place pickles in data/plinder/raw/ inside PharmaDiff.")

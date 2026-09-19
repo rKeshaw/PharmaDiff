@@ -30,7 +30,7 @@ def mol_to_torch_geometric(mol, atom_encoder, smiles):
     return data, pos_mean
 
 
-def remove_hydrogens(data: Data, pharma_data: Data):
+def remove_hydrogens(data: Data, pharma_data: Data, pocket_data: Data = None):
     to_keep = data.x > 0
     new_edge_index, new_edge_attr = subgraph(to_keep, data.edge_index, data.edge_attr, relabel_nodes=True,
                                              num_nodes=len(to_keep))    
@@ -39,8 +39,14 @@ def remove_hydrogens(data: Data, pharma_data: Data):
     mask_array = pharma_data.y[to_keep].unsqueeze(-1)
     pharma_pos = pharma_data.pos[to_keep] - mean_pos
     pharma_pos = pharma_pos * mask_array
-    return Data(x=data.x[to_keep] - 1, pos=new_pos, charges=data.charges[to_keep], edge_index=new_edge_index,
-                edge_attr=new_edge_attr), Data(x= pharma_data.x[to_keep], pos = pharma_pos, y = pharma_data.y[to_keep])
+    ligand_res = Data(x=data.x[to_keep] - 1, pos=new_pos, charges=data.charges[to_keep], edge_index=new_edge_index,
+                      edge_attr=new_edge_attr)
+    pharma_res = Data(x=pharma_data.x[to_keep], pos=pharma_pos, y=pharma_data.y[to_keep])
+    if pocket_data is not None:
+        pocket_pos = pocket_data.pos - mean_pos
+        pocket_res = Data(x=pocket_data.x, pos=pocket_pos)
+        return ligand_res, pharma_res, pocket_res
+    return ligand_res, pharma_res
 
 
 def save_pickle(array, path):

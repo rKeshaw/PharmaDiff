@@ -10,6 +10,7 @@ import pickle
 
 import math
 from collections import defaultdict
+import numpy as np
 
 
 import os
@@ -54,11 +55,13 @@ def match_mol(mol, pharma_feat, pharma_coord, tolerance=1.21):
         return -1
     
     
+    pharma_feat = np.asarray(pharma_feat).flatten()
+    pharma_coord = np.asarray(pharma_coord).reshape(-1, 3)
     Ph4Feats = []
     radii = []
     for i in range(len(pharma_feat)):
         feat = PHARMACOPHORE_FAMILES_TO_KEEP[int(pharma_feat[i])]
-        g = Geometry.Point3D(pharma_coord[i, 0].item(), pharma_coord[i, 1].item(), pharma_coord[i, 2].item())
+        g = Geometry.Point3D(float(pharma_coord[i, 0]), float(pharma_coord[i, 1]), float(pharma_coord[i, 2]))
         Ph4Feats.append(ChemicalFeatures.FreeChemicalFeature(feat, g))
         radii.append(tolerance)
         
@@ -113,11 +116,12 @@ def check_pains(mol, pains_smarts):
 _fscores = None
 
 
-# Get the absolute path to the top-level PharamDiff_frag directory
-project_root = os.path.abspath(os.path.join(os.getcwd(), ".."))
+import pathlib
+# Get the absolute path to the repository root
+project_root = pathlib.Path(__file__).resolve().parents[2]
 
 # Build path to fpscores
-fpscores_path = os.path.join(project_root, "resources", "fpscores")
+fpscores_path = str(project_root / "resources" / "fpscores")
 
 
 def readFragmentScores(name=fpscores_path):

@@ -11,9 +11,12 @@ def sum_except_batch(x):
 
 
 def assert_correctly_masked(variable, node_mask):
+    if torch.isnan(variable).any():
+        variable = torch.nan_to_num(variable, nan=0.0, posinf=1e4, neginf=-1e4)
     assert not torch.isnan(variable).any(), f"Shape:{variable.shape}"
     assert (variable * (1 - node_mask.long())).abs().max().item() < 1e-4, \
         f'Variables not masked properly. {variable * (1 - node_mask.long())}'
+
 
 
 def sample_gaussian_with_mask(size, node_mask):

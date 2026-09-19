@@ -20,14 +20,30 @@ from pharmadiff.utils import NoSyncMAE as MeanAbsoluteError
 from pharmadiff.metrics.metrics_utils import counter_to_tensor, wasserstein1d, total_variation1d
 from pharmadiff.metrics.rdkit_match_eval import match_mol, check_ring_filter, check_pains, calculateScore
 from pharmadiff.metrics.pgmg_pharma_match_score import match_score
+from pharmadiff.metrics.pocket_metrics import PocketMetrics
 
-project_root = os.path.abspath(os.path.join(os.getcwd(), ".."))
-
-# Path to the WEHI PAINS CSV
-wehi_pains_path = os.path.join(project_root, "resources", "wehi_pains.csv")
+import pathlib
+project_root = pathlib.Path(__file__).resolve().parents[2]
+wehi_pains_path = str(project_root / "resources" / "wehi_pains.csv")
+if not os.path.exists(wehi_pains_path):
+    from rdkit import RDConfig
+    wehi_pains_path = os.path.join(RDConfig.RDDataDir, "Pains", "wehi_pains.csv")
 
 
 rdkit_metrics = True
+
+
+def safe_compute(metric, default=0.0):
+    if getattr(metric, "_update_called", True) is False:
+        return torch.tensor(default)
+    if hasattr(metric, "total") and metric.total == 0:
+        return torch.tensor(default)
+    try:
+        res = metric.compute()
+        return torch.tensor(default) if torch.isnan(res) else res
+    except Exception:
+        return torch.tensor(default)
+
 
 class SamplingMetrics(nn.Module):
     def __init__(self, train_smiles, dataset_infos, test):
@@ -70,6 +86,7 @@ class SamplingMetrics(nn.Module):
         self.pgmg_valid_percentage = MeanMetric()
         self.pgmg_valid_above_threshold = MeanMetric()
         self.rdkit_valid_pharma_match = MeanMetric()
+        self.pocket_metrics = PocketMetrics()
 
 
     def reset(self):
@@ -83,6 +100,7 @@ class SamplingMetrics(nn.Module):
                        self.rdkit_valid_pharma_match, self.pgmg_valid_match_score, self.pgmg_valid_percentage,
                        self.pgmg_valid_above_threshold]:
             metric.reset()
+        self.pocket_metrics.reset()
 
     def compute_validity(self, generated):
         """ generated: list of couples (positions, atom_types)"""
@@ -182,25 +200,37 @@ class SamplingMetrics(nn.Module):
         #RDKit metrics
         if rdkit_metrics:       
             self.rdkit_pharma_satisfaction(generated)
-            self.rdkit_sas_and_qed(valid_rdkit_mols)
             self.pgmg_match_score_fn(generated)
-            self.rdkit_valid_pharma_satisfaction(valid_mols, valid_rdkit_mols)
-            self.pgmg_valid_match_score_fn(valid_mols, valid_rdkit_mols)
-            rdkit_pharma_match = self.rdkit_pharma_match.compute()
-            rdkit_SAS = self.rdkit_SAS.compute()
-            rdkit_QED = self.rdkit_QED.compute()
-            ring_filter = self.ring_filter.compute()
-            pains_filter = self.pains_filter.compute()
-            pass_2d_filter = self.pass_2d_filter.compute()
-            pgmg_match_score = self.pgmg_match_score.compute()
-            percentage_pgmg = self.pgmg_percentage.compute()
-            pgmg_above_threshold = self.pgmg_abobe_threshold.compute()
-            n_rings = self.n_rings.compute()
-            
-            pgmg_valid_match_score = self.pgmg_valid_match_score.compute()
-            pgmg_valid_percentage = self.pgmg_valid_percentage.compute()
-            pgmg_valid_above_threshold = self.pgmg_valid_above_threshold.compute()
-            rdkit_valid_pharma_match = self.rdkit_valid_pharma_match.compute()
+            rdkit_pharma_match = safe_compute(self.rdkit_pharma_match)
+            pgmg_match_score = safe_compute(self.pgmg_match_score)
+            percentage_pgmg = safe_compute(self.pgmg_percentage)
+            pgmg_above_threshold = safe_compute(self.pgmg_abobe_threshold)
+
+            if len(valid_rdkit_mols) > 0:
+                self.rdkit_sas_and_qed(valid_rdkit_mols)
+                self.rdkit_valid_pharma_satisfaction(valid_mols, valid_rdkit_mols)
+                self.pgmg_valid_match_score_fn(valid_mols, valid_rdkit_mols)
+                rdkit_SAS = safe_compute(self.rdkit_SAS)
+                rdkit_QED = safe_compute(self.rdkit_QED)
+                ring_filter = safe_compute(self.ring_filter)
+                pains_filter = safe_compute(self.pains_filter)
+                pass_2d_filter = safe_compute(self.pass_2d_filter)
+                n_rings = safe_compute(self.n_rings)
+                pgmg_valid_match_score = safe_compute(self.pgmg_valid_match_score)
+                pgmg_valid_percentage = safe_compute(self.pgmg_valid_percentage)
+                pgmg_valid_above_threshold = safe_compute(self.pgmg_valid_above_threshold)
+                rdkit_valid_pharma_match = safe_compute(self.rdkit_valid_pharma_match)
+            else:
+                rdkit_SAS = torch.tensor(0.0)
+                rdkit_QED = torch.tensor(0.0)
+                ring_filter = torch.tensor(0.0)
+                pains_filter = torch.tensor(0.0)
+                pass_2d_filter = torch.tensor(0.0)
+                n_rings = torch.tensor(0.0)
+                pgmg_valid_match_score = torch.tensor(0.0)
+                pgmg_valid_percentage = torch.tensor(0.0)
+                pgmg_valid_above_threshold = torch.tensor(0.0)
+                rdkit_valid_pharma_match = torch.tensor(0.0)
          
 
             print(f"rdkit pharmacophore match: {rdkit_pharma_match * 100 :.2f}%")
@@ -231,7 +261,47 @@ class SamplingMetrics(nn.Module):
                     'pgmg_percentage': percentage_pgmg,
                     'pgmg_abobe_threshold': pgmg_above_threshold
                     }
+                if len(valid_mols) > 0:
+                    dic.update({
+                        'pgmg_valid_match_score': pgmg_valid_match_score,
+                        'pgmg_valid_percentage': pgmg_valid_percentage,
+                        'pgmg_valid_above_threshold': pgmg_valid_above_threshold,
+                        'rdkit_valid_pharma_match': rdkit_valid_pharma_match
+                    })
+
                 wandb.log(dic, commit=False)
+
+        # Pocket metrics evaluation if any molecule has pocket data
+        has_pocket = any(hasattr(m, 'pocket_pos') and m.pocket_pos is not None for m in generated)
+        if has_pocket:
+            for mol in generated:
+                if hasattr(mol, 'pocket_pos') and mol.pocket_pos is not None:
+                    atom_names = [self.atom_decoder[a.item()] for a in mol.atom_types]
+                    n_rot = 0
+                    if mol.rdkit_mol is not None:
+                        try:
+                            from rdkit.Chem import Descriptors
+                            n_rot = Descriptors.NumRotatableBonds(mol.rdkit_mol)
+                        except Exception:
+                            pass
+                    self.pocket_metrics.update(
+                        ligand_pos=mol.positions,
+                        ligand_atom_types=atom_names,
+                        pocket_pos=mol.pocket_pos,
+                        pocket_atom_types=getattr(mol, 'pocket_atom_types', None),
+                        num_rotatable_bonds=n_rot
+                    )
+            pocket_results = self.pocket_metrics.compute()
+            print(f"Pocket severe clash rate (<1.5Å): {pocket_results.get('pocket/severe_clash_rate', 0.0)*100:.1f}%")
+            print(f"Pocket mild clash rate (<2.0Å): {pocket_results.get('pocket/mild_clash_rate', 0.0)*100:.1f}%")
+            print(f"Pocket min distance: {pocket_results.get('pocket/min_distance_mean', 0.0):.2f}Å")
+            print(f"Pocket contact ratio: {pocket_results.get('pocket/contact_ratio_mean', 0.0)*100:.1f}%")
+            print(f"Pocket Vina score (mean): {pocket_results.get('pocket/vina_score_mean', 0.0):.2f} kcal/mol")
+            print(f"Pocket Vina score (top1): {pocket_results.get('pocket/vina_score_top1', 0.0):.2f} kcal/mol")
+            print(f"Pocket Vina score (top10): {pocket_results.get('pocket/vina_score_top10', 0.0):.2f} kcal/mol")
+            if wandb.run and pocket_results:
+                wandb.log(pocket_results, commit=False)
+
         return all_smiles
 
 
@@ -255,9 +325,9 @@ class SamplingMetrics(nn.Module):
         all_generated_smiles = self.evaluate(molecules, local_rank=local_rank)        
         # Save in any case in the graphs folder
         os.makedirs('graphs', exist_ok=True)
-        textfile = open(f'graphs/valid_unique_molecules_e{current_epoch}_GR{local_rank}.txt', "w")
-        textfile.writelines(all_generated_smiles)
-        textfile.close()
+        with open(f'graphs/valid_unique_molecules_e{current_epoch}_GR{local_rank}.txt', "w") as textfile:
+            for smiles in all_generated_smiles:
+                textfile.write(f"{smiles}\n")
         # Save in the root folder if test_model
         if self.test:
             filename = f'final_smiles_GR{local_rank}_{0}.txt'

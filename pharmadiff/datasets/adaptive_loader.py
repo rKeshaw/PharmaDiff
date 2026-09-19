@@ -31,9 +31,6 @@ class AdaptiveCollater:
         # errors on other options
         elem = batch[0]['ligand']
         if isinstance(elem, BaseData):
-            mols_to_keep = []
-            pharma_to_keep = []
-
             graph_sizes = []
 
             for e in batch:
@@ -60,18 +57,30 @@ class AdaptiveCollater:
                     if len(indices_to_keep) < potential_ebs:
                         indices_to_keep.add(argsort[index].item())
 
+            mols_to_keep = []
+            pharma_to_keep = []
+            pocket_to_keep = []
+            has_pocket = 'pocket' in batch[0] and batch[0]['pocket'] is not None
+
             for i, e in enumerate(batch):
                 e['ligand']: BaseData
                 if i in indices_to_keep:
                     mols_to_keep.append(e['ligand'])
                     pharma_to_keep.append(e['pharmacophore'])
+                    if has_pocket:
+                        pocket_to_keep.append(e['pocket'])
 
             mols_new_batch = Batch.from_data_list(mols_to_keep, self.follow_batch, self.exclude_keys)
             pharma_new_batch = Batch.from_data_list(pharma_to_keep, self.follow_batch, self.exclude_keys)
 
-            return {
-            'ligand': mols_new_batch,
-            'pharmacophore': pharma_new_batch}
+            res = {
+                'ligand': mols_new_batch,
+                'pharmacophore': pharma_new_batch
+            }
+            if has_pocket:
+                res['pocket'] = Batch.from_data_list(pocket_to_keep, self.follow_batch, self.exclude_keys)
+
+            return res
 
         elif True:
             # early exit

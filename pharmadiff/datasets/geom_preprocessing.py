@@ -1,119 +1,177 @@
-from rdkit import Chem
-import numpy as np
-import torch
-from torch_geometric import data
-import numpy.random as npr
+"""
+geom_preprocessing.py
+Preprocesses the GEOM-Drugs dataset for PharmaDiff.
+Downloads raw parquet shard from Hugging Face if needed, parses 3D conformers,
+extracts 3D pharmacophores, removes hydrogens, computes dataset statistics, and saves
+processed train/val/test splits to data/geom/processed/ matching GeomDrugsDataset requirements.
+"""
+
+import os
 import pickle
 import pathlib
-import os
-import os.path as osp
-# import msgpack
+from pathlib import Path
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
+import torch
+from rdkit import Chem, RDLogger
+
+import pharmadiff.datasets.dataset_utils as dataset_utils
+from pharmadiff.datasets.dataset_utils import save_pickle
+from pharmadiff.metrics.metrics_utils import compute_all_statistics
+from pharmadiff.datasets.pharmacophore_utils import mol_to_torch_pharmacophore
+from pharmadiff.datasets.geom_dataset import full_atom_encoder
+
+HF_PARQUET_URL = "https://huggingface.co/datasets/eamag/drugs-75k/resolve/main/data/train-00000-of-00004.parquet"
 
 
-data_path = ""
+def download_raw_parquet(raw_dir: Path) -> Path:
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = raw_dir / "geom_drugs_shard0.parquet"
+    if not parquet_path.exists():
+        print(f"Downloading GEOM-Drugs shard to {parquet_path}...")
+        import urllib.request
+        urllib.request.urlretrieve(HF_PARQUET_URL, parquet_path)
+        print(f"Downloaded ({parquet_path.stat().st_size / (1024*1024):.1f} MB).")
+    else:
+        print(f"Found cached GEOM-Drugs shard at {parquet_path}.")
+    return parquet_path
 
 
-def save_pickle(array, path):
-    with open(path, 'wb') as f:
-        pickle.dump(array, f)
+def process_and_save_split(split_name: str, records: list, out_dir: Path, remove_h: bool = True):
+    RDLogger.DisableLog('rdApp.*')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    h = 'noh' if remove_h else 'h'
 
-def load_pickle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+    atom_encoder = full_atom_encoder
+    if remove_h:
+        atom_encoder = {k: v - 1 for k, v in atom_encoder.items() if k != 'H'}
 
-
-def random_split(data_list, val_proportion=0.1, test_proportion=0.1, seed=0):
-    num_mol = len(data_list)
-    num_test_mols = int(num_mol * test_proportion)
-    num_val_mols = int(num_mol * val_proportion)
-    num_train_mols = int(num_mol - num_test_mols - num_val_mols)
-
-    split = ['test'] * num_test_mols + ['val'] * num_val_mols + ['train'] * num_train_mols
-    shuffle = np.random.RandomState(seed).permutation(num_mol)
-    split = np.array(split)[shuffle]
-
-    train_data = []
-    val_data = []
-    test_data = []
-    for data, s in zip(data_list, split):
-        if s == 'train':
-            train_data.append(data)
-        elif s == 'val':
-            val_data.append(data)
-        else:
-            test_data.append(data)
-
-    save_pickle(train_data, '/home/vignac/MoleculeDiffusion/data/geom/rdkit_folder/train_data.pickle')
-    save_pickle(val_data, '/home/vignac/MoleculeDiffusion/data/geom/rdkit_folder/val_data.pickle')
-    save_pickle(test_data, '/home/vignac/MoleculeDiffusion/data/geom/rdkit_folder/test_data.pickle')
-    return
-
-
-def save_train_smiles(train_data_path, output_file='train_smiles_set.pickle'):
-    train_data = load_pickle(train_data_path)
-    train_smiles = []
-    for smiles, _ in train_data:
-        train_smiles.append(smiles)
-    train_smiles = set(train_smiles)
-    output_path = osp.join(pathlib.Path(train_data_path).parent, output_file)
-    save_pickle(train_smiles, output_path)
-
-
-def extract_conformers(args):
-    drugs_file = os.path.join(args.data_dir, args.data_file)
-    save_file = f"geom_drugs_{'no_h_' if args.remove_h else ''}{args.conformations}"
-    smiles_list_file = 'geom_drugs_smiles.txt'
-    number_atoms_file = f"geom_drugs_n_{'no_h_' if args.remove_h else ''}{args.conformations}"
-
-    unpacker = msgpack.Unpacker(open(drugs_file, "rb"))
-
+    data_list = []
+    mols_list = []
     all_smiles = []
-    all_number_atoms = []
-    dataset_conformers = []
-    mol_id = 0
-    for i, drugs_1k in enumerate(unpacker):
-        print(f"Unpacking file {i}...")
-        for smiles, all_info in drugs_1k.items():
+    all_smiles_noh = []
+
+    print(f"Processing split '{split_name}' ({len(records)} molecules)...")
+    for rec in tqdm(records, desc=f"Building {split_name}"):
+        smiles = rec['smiles']
+        conformers_blocks = rec['conformers']
+        energies = rec.get('energies', None)
+
+        if len(conformers_blocks) == 0:
+            continue
+
+        # Sort by energy if available, otherwise take first
+        if energies is not None and len(energies) == len(conformers_blocks):
+            sorted_indices = np.argsort(energies)
+        else:
+            sorted_indices = list(range(len(conformers_blocks)))
+
+        # Take the lowest energy conformer
+        chosen_idx = sorted_indices[0]
+        mol_block = conformers_blocks[chosen_idx]
+
+        try:
+            conformer = Chem.MolFromMolBlock(mol_block, removeHs=False)
+            if conformer is None:
+                continue
+            Chem.SanitizeMol(conformer)
+            Chem.Kekulize(conformer)
+        except Exception:
+            continue
+
+        try:
+            data, pos_mean = dataset_utils.mol_to_torch_geometric(conformer, full_atom_encoder, smiles)
+            pharmacophore = mol_to_torch_pharmacophore(conformer, pos_mean, name='geom')
+            if pharmacophore is None:
+                continue
+
+            if remove_h:
+                data, pharmacophore = dataset_utils.remove_hydrogens(data, pharmacophore)
+
+            data_list.append({"ligand": data, "pharmacophore": pharmacophore})
+            mols_list.append(data)
             all_smiles.append(smiles)
-            conformers = all_info['conformers']
-            # Get the energy of each conformer. Keep only the lowest values
-            all_energies = []
-            for conformer in conformers:
-                all_energies.append(conformer['totalenergy'])
-            all_energies = np.array(all_energies)
-            argsort = np.argsort(all_energies)
-            lowest_energies = argsort[:args.conformations]
-            for id in lowest_energies:
-                conformer = conformers[id]
-                coords = np.array(conformer['xyz']).astype(float)        # n x 4
-                if args.remove_h:
-                    mask = coords[:, 0] != 1.0
-                    coords = coords[mask]
-                n = coords.shape[0]
-                all_number_atoms.append(n)
-                mol_id_arr = mol_id * np.ones((n, 1), dtype=float)
-                id_coords = np.hstack((mol_id_arr, coords))
 
-                dataset_conformers.append(id_coords)
-                mol_id += 1
+            try:
+                mol_no_h = Chem.RemoveHs(conformer, sanitize=False)
+                if mol_no_h is not None:
+                    s_noh = Chem.MolToSmiles(mol_no_h)
+                    if s_noh is not None:
+                        all_smiles_noh.append(s_noh)
+            except Exception:
+                pass
+        except Exception:
+            continue
 
-    print("Total number of conformers saved", mol_id)
-    all_number_atoms = np.array(all_number_atoms)
-    dataset = np.vstack(dataset_conformers)
+    print(f"Successfully processed {len(data_list)} valid items for split '{split_name}'.")
+    assert len(data_list) > 0, f"No valid data processed for {split_name}!"
 
-    print("Total number of atoms in the dataset", dataset.shape[0])
-    print("Average number of atoms per molecule", dataset.shape[0] / mol_id)
+    # Collate and save .pt
+    ligands = [item['ligand'] for item in data_list]
+    pharmacophores = [item['pharmacophore'] for item in data_list]
+    collated_data = {'ligand': ligands, 'pharmacophore': pharmacophores}
+    pt_path = out_dir / f"{split_name}_{h}.pt"
+    torch.save(collated_data, pt_path)
+    print(f"Saved {pt_path}")
 
-    # Save conformations
-    np.save(os.path.join(args.data_dir, save_file), dataset)
-    # Save SMILES
-    with open(os.path.join(args.data_dir, smiles_list_file), 'w') as f:
-        for s in all_smiles:
-            f.write(s)
-            f.write('\n')
+    # Compute statistics
+    print(f"Computing dataset statistics for '{split_name}'...")
+    statistics = compute_all_statistics(mols_list, atom_encoder,
+                                        charges_dic={-2: 0, -1: 1, 0: 2, 1: 3, 2: 4, 3: 5})
 
-    # Save number of atoms per conformation
-    np.save(os.path.join(args.data_dir, number_atoms_file), all_number_atoms)
-    print("Dataset processed.")
+    save_pickle(statistics.num_nodes, out_dir / f"{split_name}_n_{h}.pickle")
+    np.save(out_dir / f"{split_name}_atom_types_{h}.npy", statistics.atom_types)
+    np.save(out_dir / f"{split_name}_bond_types_{h}.npy", statistics.bond_types)
+    np.save(out_dir / f"{split_name}_charges_{h}.npy", statistics.charge_types)
+    save_pickle(statistics.valencies, out_dir / f"{split_name}_valency_{h}.pickle")
+    save_pickle(statistics.bond_lengths, out_dir / f"{split_name}_bond_lengths_{h}.pickle")
+    np.save(out_dir / f"{split_name}_angles_{h}.npy", statistics.bond_angles)
+    save_pickle(set(all_smiles), out_dir / f"{split_name}_smiles.pickle")
+    save_pickle(set(all_smiles_noh), out_dir / f"goem_{split_name}_smiles_noh.pickle")
+    print(f"Completed saving all statistics for '{split_name}' in {out_dir}")
 
 
+def prepare_geom_dataset(data_dir: Path, n_train: int = 400, n_val: int = 50, n_test: int = 50,
+                         remove_h: bool = True, seed: int = 42):
+    raw_dir = data_dir / "raw"
+    processed_dir = data_dir / "processed"
+    parquet_path = download_raw_parquet(raw_dir)
+
+    print(f"Loading parquet {parquet_path}...")
+    df = pd.read_parquet(parquet_path)
+    total_needed = n_train + n_val + n_test
+    print(f"Dataset has {len(df)} molecules. Subsetting {total_needed} molecules...")
+
+    # Shuffle deterministically
+    df_sample = df.sample(n=min(len(df), total_needed + 100), random_state=seed).reset_index(drop=True)
+
+    records = []
+    for idx, row in df_sample.iterrows():
+        records.append({
+            'smiles': row['smiles'],
+            'conformers': row['conformers'],
+            'energies': row.get('conformer_energies', None)
+        })
+
+    train_records = records[:n_train]
+    val_records = records[n_train:n_train + n_val]
+    test_records = records[n_train + n_val:n_train + n_val + n_test]
+
+    print(f"Splits allocated: {len(train_records)} train, {len(val_records)} val, {len(test_records)} test.")
+    process_and_save_split("train", train_records, processed_dir, remove_h=remove_h)
+    process_and_save_split("val", val_records, processed_dir, remove_h=remove_h)
+    process_and_save_split("test", test_records, processed_dir, remove_h=remove_h)
+    print("\n>>> GEOM dataset preparation complete! Ready for training and evaluation. <<<")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="/data/venkatgb/keshaw/PharmaDiff/data/geom")
+    parser.add_argument("--n_train", type=int, default=400)
+    parser.add_argument("--n_val", type=int, default=50)
+    parser.add_argument("--n_test", type=int, default=50)
+    args = parser.parse_args()
+
+    prepare_geom_dataset(Path(args.data_dir), n_train=args.n_train, n_val=args.n_val, n_test=args.n_test)

@@ -1,6 +1,32 @@
 # Do not move these imports, the order seems to matter
 import torch
+import functools
+_orig_torch_load = torch.load
+@functools.wraps(_orig_torch_load)
+def _safe_torch_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _safe_torch_load
+
+try:
+    import omegaconf.dictconfig
+    import omegaconf.listconfig
+    import omegaconf.basecontainer
+    if hasattr(torch.serialization, 'add_safe_globals'):
+        torch.serialization.add_safe_globals([
+            omegaconf.dictconfig.DictConfig,
+            omegaconf.listconfig.ListConfig,
+            omegaconf.basecontainer.BaseContainer
+        ])
+except Exception:
+    pass
+
 import pytorch_lightning as pl
+try:
+    import lightning_fabric.utilities.cloud_io as cloud_io
+    cloud_io.torch.load = _safe_torch_load
+except Exception:
+    pass
 
 import os
 import warnings
@@ -31,6 +57,8 @@ def get_resume(cfg, dataset_infos, train_smiles, checkpoint_path, test: bool):
                                                         train_smiles=train_smiles)
     cfg.general.gpus = gpus
     cfg.general.name = name
+    model.cfg = cfg
+    model.test_sampling_num_per_graph = getattr(cfg.general, 'test_sampling_num_per_graph', 1)
     return cfg, model
 
 
@@ -38,6 +66,8 @@ def get_resume(cfg, dataset_infos, train_smiles, checkpoint_path, test: bool):
 def main(cfg: omegaconf.DictConfig):
     dataset_config = cfg.dataset
     pl.seed_everything(cfg.train.seed)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
 
     if dataset_config.name in ['qm9', "geom", "plinder"]:
         if dataset_config.name == 'qm9':
@@ -58,7 +88,7 @@ def main(cfg: omegaconf.DictConfig):
         raise NotImplementedError("Unknown dataset {}".format(cfg["dataset"]))
 
     if cfg.general.test_only:
-        cfg, _ = get_resume(cfg, dataset_infos, train_smiles, cfg.general.test_only, test=True)
+        cfg, model = get_resume(cfg, dataset_infos, train_smiles, cfg.general.test_only, test=True)
         
         if cfg.general.test_sampling_num_per_graph > 1 and cfg.general.sample_condition is None:
 
@@ -82,38 +112,46 @@ def main(cfg: omegaconf.DictConfig):
     elif cfg.general.resume is not None:
         # When resuming, we can override some parts of previous configuration
         print("Resuming from {}".format(cfg.general.resume))
-        cfg, _ = get_resume(cfg, dataset_infos, train_smiles, cfg.general.resume, test=False)
+        cfg, model = get_resume(cfg, dataset_infos, train_smiles, cfg.general.resume, test=False)
 
-    # utils.create_folders(cfg)
-
-    model = FullDenoisingDiffusion(cfg=cfg, dataset_infos=dataset_infos, train_smiles=train_smiles)
+    else:
+        model = FullDenoisingDiffusion(cfg=cfg, dataset_infos=dataset_infos, train_smiles=train_smiles)
 
     callbacks = []
-    # need to ignore metrics because otherwise ddp tries to sync them
-    params_to_ignore = ['module.model.train_smiles', 'module.model.dataset_infos']
-
-    torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, params_to_ignore)
+    use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
+    if use_gpu and cfg.general.gpus > 1:
+        # need to ignore metrics because otherwise ddp tries to sync them
+        params_to_ignore = ['module.model.train_smiles', 'module.model.dataset_infos']
+        torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, params_to_ignore)
 
     if cfg.train.save_model:
-        checkpoint_callback = ModelCheckpoint(dirpath=f"checkpoints/{cfg.general.name}",
+        try:
+            repo_root = hydra.utils.get_original_cwd()
+        except Exception:
+            repo_root = os.getcwd()
+        ckpt_dir = os.path.join(repo_root, "checkpoints", cfg.general.name)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        save_top_k = getattr(cfg.train, 'save_top_k', 3)
+        checkpoint_callback = ModelCheckpoint(dirpath=ckpt_dir,
                                               filename='{epoch}',
                                               monitor='val/epoch_NLL',
-                                              save_top_k=-1,
+                                              save_top_k=save_top_k,
                                               mode='min',
-                                              every_n_epochs=1)
+                                              every_n_epochs=cfg.general.check_val_every_n_epochs)
         # fix a name and keep overwriting
-        last_ckpt_save = ModelCheckpoint(dirpath=f"checkpoints/{cfg.general.name}", filename='last', every_n_epochs=1)
+        last_ckpt_save = ModelCheckpoint(dirpath=ckpt_dir, filename='last', every_n_epochs=1)
         callbacks.append(checkpoint_callback)
         callbacks.append(last_ckpt_save)
-
-    use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
 
     name = cfg.general.name
     if name == 'debug':
         print("[WARNING]: Run is called 'debug' -- it will run with fast_dev_run. ")
 
+    strategy = "ddp_find_unused_parameters_true" if (use_gpu and cfg.general.gpus > 1) else "auto"
+    log_steps = getattr(cfg.general, 'log_every_steps', 50) if name != 'debug' else 1
+
     trainer = Trainer(gradient_clip_val=cfg.train.clip_grad,
-                      strategy="ddp_find_unused_parameters_true",  # Needed to load old checkpoints
+                      strategy=strategy,
                       accelerator='gpu' if use_gpu else 'cpu',
                       devices=cfg.general.gpus if use_gpu else 1,
                       max_epochs=cfg.train.n_epochs,
@@ -121,7 +159,7 @@ def main(cfg: omegaconf.DictConfig):
                       fast_dev_run=cfg.general.name == 'debug',
                       enable_progress_bar=cfg.train.progress_bar,
                       callbacks=callbacks,
-                      log_every_n_steps=50 if name != 'debug' else 1,
+                      log_every_n_steps=log_steps,
                       )
 
     if not cfg.general.test_only:

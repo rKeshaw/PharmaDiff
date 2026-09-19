@@ -1,5 +1,5 @@
-# configs/experiment/plinder_no_h_adaptive.yaml
 # @package _global_
+# configs/experiment/plinder_no_h_adaptive.yaml
 #
 # Experiment config for PLINDER training.
 # Differences from geom_no_h_adaptive.yaml:
@@ -52,6 +52,8 @@ train:
 
 model:
     n_layers: 12
+    use_pocket: False      # Set to True to enable joint protein pocket + pharmacophore conditioning
+    pocket_feat_dim: 21
     lambda_train: [5, 0.6, 1, 4, 0, 3.0, 0.2, 0.5]
     nu:
       p: 2.5
@@ -63,6 +65,7 @@ model:
 dataset:
     name: 'plinder'
     datadir: 'data/plinder/'
+    use_pocket: False      # Set to True to load pocket data (pairs with model.use_pocket)
     remove_h: True
     random_subset: null
     pin_memory: True

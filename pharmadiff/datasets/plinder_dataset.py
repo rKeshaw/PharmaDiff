@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from rdkit import Chem, RDLogger
-from torch_geometric.data import InMemoryDataset
+from torch_geometric.data import InMemoryDataset, Data
 from tqdm import tqdm
 from hydra.utils import get_original_cwd
 
@@ -70,19 +70,16 @@ from pharmadiff.datasets.pharmacophore_utils import FAMILY_MAPPING
 
 class PlinderDataset(InMemoryDataset):
     """
-    PyG InMemoryDataset backed by PLINDER ligands.
-    process() is identical to GeomDrugsDataset.process().
+    PyG InMemoryDataset backed by PLINDER ligands and optional pocket receptors.
     """
 
-    def __init__(self, split, root, remove_h,
+    def __init__(self, split, root, remove_h, use_pocket: bool = False,
                  transform=None, pre_transform=None, pre_filter=None):
         assert split in ["train", "val", "test"]
-        self.split    = split
-        self.remove_h = remove_h
-        # "geom" activates the 3-7 point pharmacophore subsampling distribution
-        # calibrated for drug-like molecules — appropriate for PLINDER's
-        # filtered drug-like ligand set
-        self.name = "geom"
+        self.split      = split
+        self.remove_h   = remove_h
+        self.use_pocket = use_pocket
+        self.name       = "geom"
 
         self.atom_encoder = full_atom_encoder
         if remove_h:
@@ -95,6 +92,7 @@ class PlinderDataset(InMemoryDataset):
 
         self.ligand        = self.full_data_dict["ligand"]
         self.pharmacophore = self.full_data_dict["pharmacophore"]
+        self.pocket        = self.full_data_dict.get("pocket", None) if self.use_pocket else None
 
         self.statistics = dataset_utils.Statistics(
             num_nodes    = load_pickle(self.processed_paths[1]),
@@ -111,7 +109,10 @@ class PlinderDataset(InMemoryDataset):
         return len(self.ligand)
 
     def __getitem__(self, idx):
-        return {"ligand": self.ligand[idx], "pharmacophore": self.pharmacophore[idx]}
+        item = {"ligand": self.ligand[idx], "pharmacophore": self.pharmacophore[idx]}
+        if self.use_pocket and self.pocket is not None:
+            item["pocket"] = self.pocket[idx]
+        return item
 
     @property
     def raw_file_names(self):
@@ -124,18 +125,19 @@ class PlinderDataset(InMemoryDataset):
     @property
     def processed_file_names(self):
         h = "noh" if self.remove_h else "h"
+        p = "_pocket" if self.use_pocket else ""
         b = self.split
         return [
-            f"{b}_{h}.pt",
-            f"{b}_n_{h}.pickle",
-            f"{b}_atom_types_{h}.npy",
-            f"{b}_bond_types_{h}.npy",
-            f"{b}_charges_{h}.npy",
-            f"{b}_valency_{h}.pickle",
-            f"{b}_bond_lengths_{h}.pickle",
-            f"{b}_angles_{h}.npy",
-            f"{b}_smiles.pickle",
-            f"plinder_{b}_smiles_{h}.pickle",
+            f"{b}_{h}{p}.pt",
+            f"{b}_n_{h}{p}.pickle",
+            f"{b}_atom_types_{h}{p}.npy",
+            f"{b}_bond_types_{h}{p}.npy",
+            f"{b}_charges_{h}{p}.npy",
+            f"{b}_valency_{h}{p}.pickle",
+            f"{b}_bond_lengths_{h}{p}.pickle",
+            f"{b}_angles_{h}{p}.npy",
+            f"{b}_smiles{p}.pickle",
+            f"plinder_{b}_smiles_{h}{p}.pickle",
         ]
 
     def download(self):
@@ -146,23 +148,29 @@ class PlinderDataset(InMemoryDataset):
 
     def process(self):
         """
-        Identical to GeomDrugsDataset.process().
-        Mols in the pickle have H — remove_hydrogens() handles H removal
-        and re-centering exactly as in GEOM.
+        Processes PLINDER data into PyG Data objects.
+        Supports both ligand-only mode and joint pocket + ligand mode.
         """
         RDLogger.DisableLog("rdApp.*")
         all_data = load_pickle(self.raw_paths[0])
 
-        data_list    = []
-        mols_list    = []
-        all_smiles   = []
+        data_list      = []
+        mols_list      = []
+        all_smiles     = []
         all_smiles_noh = []
-        skipped      = 0
+        skipped        = 0
 
-        for smiles, conformers in tqdm(all_data, desc=f"Processing {self.split}"):
+        for entry in tqdm(all_data, desc=f"Processing {self.split} (use_pocket={self.use_pocket})"):
+            pocket_info = None
+            if len(entry) >= 3:
+                smiles, conformers, pocket_info = entry[0], entry[1], entry[2]
+            elif len(entry) == 2:
+                smiles, conformers = entry[0], entry[1]
+            else:
+                continue
+
             all_smiles.append(smiles)
 
-            # Only the first (and only) conformer — crystal bound pose
             for conformer in conformers[:1]:
                 try:
                     Chem.SanitizeMol(conformer)
@@ -181,19 +189,34 @@ class PlinderDataset(InMemoryDataset):
                     skipped += 1
                     continue
 
+                pocket_data = None
+                if self.use_pocket and pocket_info is not None:
+                    res_idx = torch.from_numpy(pocket_info["res_idx"]).long()
+                    pocket_x = F.one_hot(res_idx, num_classes=21).float()
+                    pocket_coords = torch.from_numpy(pocket_info["pos"]).float()
+                    # Initial center matching pos_mean from mol_to_torch_geometric
+                    pocket_coords = pocket_coords - pos_mean
+                    pocket_data = Data(x=pocket_x, pos=pocket_coords)
+
                 if self.remove_h:
-                    # Identical to GEOM: conformer has H, remove_hydrogens
-                    # strips them and re-centers on heavy atoms
-                    data, pharmacophore = dataset_utils.remove_hydrogens(
-                        data, pharmacophore
-                    )
+                    if self.use_pocket and pocket_data is not None:
+                        data, pharmacophore, pocket_data = dataset_utils.remove_hydrogens(
+                            data, pharmacophore, pocket_data
+                        )
+                    else:
+                        data, pharmacophore = dataset_utils.remove_hydrogens(
+                            data, pharmacophore
+                        )
 
                 if self.pre_filter is not None and not self.pre_filter(data):
                     continue
                 if self.pre_transform is not None:
                     data = self.pre_transform(data)
 
-                data_list.append({"ligand": data, "pharmacophore": pharmacophore})
+                item = {"ligand": data, "pharmacophore": pharmacophore}
+                if self.use_pocket and pocket_data is not None:
+                    item["pocket"] = pocket_data
+                data_list.append(item)
                 mols_list.append(data)
 
                 try:
@@ -207,7 +230,7 @@ class PlinderDataset(InMemoryDataset):
 
         print(f"Processed {len(data_list):,}  |  skipped {skipped:,}")
 
-        torch.save(self._collate(data_list), self.processed_paths[0])
+        torch.save(self._collate(data_list, use_pocket=self.use_pocket), self.processed_paths[0])
 
         stats = compute_all_statistics(
             mols_list,
@@ -225,22 +248,32 @@ class PlinderDataset(InMemoryDataset):
         save_pickle(set(all_smiles_noh), self.processed_paths[9])
 
     @staticmethod
-    def _collate(data_list):
-        return {
+    def _collate(data_list, use_pocket=False):
+        collate_dict = {
             "ligand":        [d["ligand"]        for d in data_list],
             "pharmacophore": [d["pharmacophore"] for d in data_list],
         }
+        if use_pocket and "pocket" in data_list[0]:
+            collate_dict["pocket"] = [d["pocket"] for d in data_list]
+        return collate_dict
 
 
 class PlinderDataModule(AbstractAdaptiveDataModule):
     def __init__(self, cfg):
         self.datadir = cfg.dataset.datadir
-        base_path = pathlib.Path(get_original_cwd()).parents[0]
-        root_path = os.path.join(base_path, self.datadir)
+        try:
+            cwd = pathlib.Path(get_original_cwd())
+        except Exception:
+            cwd = pathlib.Path.cwd()
+        repo_root = cwd.parent if cwd.name == "pharmadiff" else cwd
+        root_path = os.path.join(repo_root, self.datadir)
 
-        train = PlinderDataset(split="train", root=root_path, remove_h=cfg.dataset.remove_h)
-        val   = PlinderDataset(split="val",   root=root_path, remove_h=cfg.dataset.remove_h)
-        test  = PlinderDataset(split="test",  root=root_path, remove_h=cfg.dataset.remove_h)
+        model_cfg = getattr(cfg, "model", None)
+        dataset_cfg = getattr(cfg, "dataset", None)
+        self.use_pocket = getattr(model_cfg, "use_pocket", False) or getattr(dataset_cfg, "use_pocket", False)
+        train = PlinderDataset(split="train", root=root_path, remove_h=cfg.dataset.remove_h, use_pocket=self.use_pocket)
+        val   = PlinderDataset(split="val",   root=root_path, remove_h=cfg.dataset.remove_h, use_pocket=self.use_pocket)
+        test  = PlinderDataset(split="test",  root=root_path, remove_h=cfg.dataset.remove_h, use_pocket=self.use_pocket)
 
         self.remove_h   = cfg.dataset.remove_h
         self.statistics = {
@@ -259,6 +292,9 @@ class PlinderInfos(AbstractDatasetInfos):
         self.name             = "geom"
         self.atom_encoder     = full_atom_encoder
         self.collapse_charges = torch.Tensor([-2, -1, 0, 1, 2, 3]).int()
+        self.use_pocket       = getattr(cfg.model, "use_pocket", False) or getattr(cfg.dataset, "use_pocket", False)
+        self.pocket_feat_dim  = 21 if self.use_pocket else 0
+        self.use_pharma       = getattr(cfg.model, "use_pharma", True)
 
         if self.remove_h:
             self.atom_encoder = {
@@ -274,7 +310,8 @@ class PlinderInfos(AbstractDatasetInfos):
 
         self.input_dims = PlaceHolder(
             X=self.num_atom_types, charges=6, E=5, y=1, pos=3,
-            pharma_feat=len(FAMILY_MAPPING), pharma_coord=3
+            pharma_feat=len(FAMILY_MAPPING), pharma_coord=3,
+            pocket_feat=self.pocket_feat_dim if self.use_pocket else None
         )
         self.output_dims = PlaceHolder(
             X=self.num_atom_types, charges=6, E=5, y=0, pos=3,

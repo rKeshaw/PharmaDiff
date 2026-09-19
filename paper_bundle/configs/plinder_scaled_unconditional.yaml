@@ -1,0 +1,58 @@
+# @package _global_
+# configs/experiment/plinder_scaled_unconditional.yaml
+#
+# Scaled PLINDER experiment with NO conditioning (use_pocket=False, use_pharma=False).
+# Unconditional 3D molecular graph diffusion baseline (MiDi architecture on PLINDER).
+# Dataset: data/plinder_scaled/ (3,081 train / 153 val / 112 test)
+
+general:
+    name: 'plinder_scaled_unconditional'
+    gpus: 1
+    wandb: 'offline'
+    test_only: null
+    evaluate_all_checkpoints: False
+
+    sample_every_val: 50
+    samples_to_generate: 64
+    samples_to_save: 10
+    chains_to_save: 1
+
+    final_model_samples_to_generate: 250
+    final_model_samples_to_save: 0
+    final_model_chains_to_save: 0
+    num_final_sampling: 1
+    test_sampling_num_per_graph: 1000
+
+    check_val_every_n_epochs: 1
+    log_every_steps: 10
+    number_chain_steps: 50
+    faster_sampling: 1
+
+train:
+    n_epochs: 500
+    batch_size: 32
+    reference_batch_size: 32
+    save_model: True
+    save_top_k: 1
+    clip_grad: 1.0
+
+model:
+    n_layers: 12
+    use_pocket: False
+    use_pharma: False
+    lambda_train: [5, 0.6, 1, 4, 0, 0.0, 0.0, 0.0]
+    nu:
+      p: 2.5
+      x: 1
+      c: 1
+      e: 1.5
+      y: 1
+
+dataset:
+    name: 'plinder'
+    datadir: 'data/plinder_scaled/'
+    use_pocket: False
+    remove_h: True
+    random_subset: null
+    pin_memory: True
+    adaptive_loader: True

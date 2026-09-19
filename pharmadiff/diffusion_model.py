@@ -27,6 +27,7 @@ from pharmadiff import utils
 import pharmadiff.analysis.visualization as visualizer
 import pharmadiff.metrics.abstract_metrics as custom_metrics
 from pharmadiff.metrics.molecular_metrics import TrainMolecularMetrics, SamplingMetrics
+from pharmadiff.metrics.micrometrics import compute_micrometrics, MicroMetricsTracker
 from pharmadiff.diffusion.extra_features import ExtraFeatures
 from pharmadiff.analysis.rdkit_functions import Molecule
 from pharmadiff.datasets.adaptive_loader import effective_batch_size
@@ -39,6 +40,12 @@ class FullDenoisingDiffusion(pl.LightningModule):
     start_epoch_time = None
     train_iterations = None
     val_iterations = None
+
+    @property
+    def local_rank(self):
+        if hasattr(self, '_trainer') and self._trainer is not None:
+            return getattr(self._trainer, 'local_rank', getattr(self, 'global_rank', 0))
+        return 0
 
     def __init__(self, cfg, dataset_infos, train_smiles):
         super().__init__()
@@ -75,11 +82,16 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.save_hyperparameters(ignore=['train_metrics', 'val_sampling_metrics', 'test_sampling_metrics',
                                           'dataset_infos', 'train_smiles'])
 
+        self.use_pocket = getattr(cfg.model, 'use_pocket', False)
+        pocket_feat_dim = getattr(cfg.model, 'pocket_feat_dim', 21)
+
         self.model = GraphTransformer(input_dims=self.input_dims,
                                       n_layers=cfg.model.n_layers,
                                       hidden_mlp_dims=cfg.model.hidden_mlp_dims,
                                       hidden_dims=cfg.model.hidden_dims,
-                                      output_dims=self.output_dims)
+                                      output_dims=self.output_dims,
+                                      use_pocket=self.use_pocket,
+                                      pocket_feat_dim=pocket_feat_dim)
 
         if cfg.model.transition == 'uniform':
             self.noise_model = DiscreteUniformTransition(output_dims=self.output_dims,
@@ -102,7 +114,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.val_dense_data = None
         self.test_dense_data = None
         self.test_sampling_num_per_graph = cfg.general.test_sampling_num_per_graph
-        
+        self.train_micrometrics_tracker = MicroMetricsTracker()
+        self.val_micrometrics_tracker = MicroMetricsTracker()
+
     def training_step(self, data, i):
         if data['ligand'].edge_index.numel() == 0:
             print("Found a batch with no edges. Skipping.")
@@ -111,15 +125,31 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.train_dense_data = dense_data
         z_t = self.noise_model.apply_noise(dense_data)
         extra_data = self.extra_features(z_t)
-        pred = self.forward(z_t, extra_data)
+        should_log = (i % self.log_every_steps == 0)
+        pred = self.forward(z_t, extra_data, collect_diagnostics=should_log)
         loss, tl_log_dict = self.train_loss(masked_pred=pred, masked_true=dense_data,
-                                            log=i % self.log_every_steps == 0)
+                                            log=should_log)
+
+        micro_dict = compute_micrometrics(
+            masked_pred=pred,
+            masked_true=dense_data,
+            z_t=z_t,
+            layer_diagnostics=getattr(self.model, 'last_diagnostics', None),
+            use_pocket=self.use_pocket,
+            T=self.T
+        )
+        self.train_micrometrics_tracker.update(micro_dict)
 
         # if self.local_rank == 0:
         tm_log_dict = self.train_metrics(masked_pred=pred, masked_true=dense_data,
-                                         log=i % self.log_every_steps == 0)
+                                         log=should_log)
         if tl_log_dict is not None:
             self.log_dict(tl_log_dict, batch_size=self.BS)
+        if should_log and micro_dict:
+            log_micro = {f"micro/{k}": v for k, v in micro_dict.items()}
+            self.log_dict(log_micro, batch_size=self.BS)
+            if wandb.run:
+                wandb.log(log_micro, commit=False)
         if tm_log_dict is not None:
             self.log_dict(tm_log_dict, batch_size=self.BS)
         return loss
@@ -127,31 +157,56 @@ class FullDenoisingDiffusion(pl.LightningModule):
     def on_validation_epoch_start(self) -> None:
         self.val_nll.reset()
         self.val_metrics.reset()
+        self.val_micrometrics_tracker.reset()
 
     def validation_step(self, data, i):
         dense_data = utils.to_dense(data, self.dataset_infos)
         self.val_dense_data = dense_data
         z_t = self.noise_model.apply_noise(dense_data)
         extra_data = self.extra_features(z_t)
-        pred = self.forward(z_t, extra_data)
+        pred = self.forward(z_t, extra_data, collect_diagnostics=True)
         nll, log_dict = self.compute_val_loss(pred, z_t, clean_data=dense_data, test=False)
+
+        val_micro = compute_micrometrics(
+            masked_pred=pred,
+            masked_true=dense_data,
+            z_t=z_t,
+            layer_diagnostics=getattr(self.model, 'last_diagnostics', None),
+            use_pocket=self.use_pocket,
+            T=self.T
+        )
+        self.val_micrometrics_tracker.update(val_micro)
         return {'loss': nll}, log_dict
 
     def on_validation_epoch_end(self) -> None:
         metrics = [self.val_nll.compute(), self.val_metrics.compute()]
+        val_micros = self.val_micrometrics_tracker.compute()
+        self.val_micrometrics_tracker.reset()
+
         log_dict = {"val/epoch_NLL": metrics[0],
                     "val/pos_mse": metrics[1]['PosMSE'] * self.T,
                     "val/X_kl": metrics[1]['XKl'] * self.T,
                     "val/E_kl": metrics[1]['EKl'] * self.T,
                     "val/charges_kl": metrics[1]['ChargesKl'] * self.T}
+
+        for k, v in val_micros.items():
+            log_dict[f"val/{k}"] = v
+
         self.log_dict(log_dict, on_epoch=True, on_step=False, sync_dist=True)
         if wandb.run:
             wandb.log(log_dict)
 
+        v_atom_acc = val_micros.get('chem/atom_acc_all', -1.0)
+        v_bond_rec = val_micros.get('chem/bond_recall_existing', -1.0)
+        v_drift = val_micros.get('geom/pharma_anchor_drift_mean', -1.0)
+        v_clash = val_micros.get('geom/internal_clash_rate', -1.0)
+
         print_str = []
-        for key, val in log_dict.items():
+        for key in ["val/epoch_NLL", "val/pos_mse", "val/X_kl", "val/E_kl", "val/charges_kl"]:
+            val = log_dict[key]
             new_val = f"{val:.2f}"
             print_str.append(f"{key}: {new_val} -- ")
+        print_str.append(f"val/atom_acc: {v_atom_acc:.3f} -- val/bond_rec: {v_bond_rec:.3f} -- val/drift: {v_drift:.3f}Å -- val/clash: {v_clash:.3f} -- ")
         print_str = ''.join(print_str)
         print(f"Epoch {self.current_epoch}: {print_str}."[:-4])
 
@@ -184,10 +239,32 @@ class FullDenoisingDiffusion(pl.LightningModule):
             utils.setup_wandb(self.cfg)
         self.test_nll.reset()
         self.test_metrics.reset()
+        self.all_test_conditions = []
 
     def test_step(self, data, i):
         dense_data = utils.to_dense(data, self.dataset_infos)
         self.test_dense_data = dense_data
+
+        if not hasattr(self, 'all_test_conditions'):
+            self.all_test_conditions = []
+        bs = dense_data.X.shape[0]
+        for b in range(bs):
+            single_condition = utils.PlaceHolder(
+                X=None, charges=None, E=None, y=None,
+                pos=None, node_mask=None,
+                pharma_coord=dense_data.pharma_coord[b].clone(),
+                pharma_feat=dense_data.pharma_feat[b].clone(),
+                pharma_mask=dense_data.pharma_mask[b].clone(),
+                pharma_atom=dense_data.pharma_atom[b].clone(),
+                pharma_atom_pos=dense_data.pharma_atom_pos[b].clone(),
+                pharma_E=dense_data.pharma_E[b].clone(),
+                pharma_charge=dense_data.pharma_charge[b].clone(),
+                pocket_pos=dense_data.pocket_pos[b].clone() if getattr(dense_data, 'pocket_pos', None) is not None else None,
+                pocket_feat=dense_data.pocket_feat[b].clone() if getattr(dense_data, 'pocket_feat', None) is not None else None,
+                pocket_mask=dense_data.pocket_mask[b].clone() if getattr(dense_data, 'pocket_mask', None) is not None else None
+            )
+            self.all_test_conditions.append(single_condition)
+
         z_t = self.noise_model.apply_noise(dense_data)
         extra_data = self.extra_features(z_t)
         pred = self.forward(z_t, extra_data)
@@ -242,7 +319,10 @@ class FullDenoisingDiffusion(pl.LightningModule):
                                                  pharma_atom=condition_subset.pharma_atom[i],
                                                  pharma_atom_pos=condition_subset.pharma_atom_pos[i],
                                                  pharma_E=condition_subset.pharma_E[i],
-                                                 pharma_charge=condition_subset.pharma_charge[i])
+                                                 pharma_charge=condition_subset.pharma_charge[i],
+                                                 pocket_pos=condition_subset.pocket_pos[i] if getattr(condition_subset, 'pocket_pos', None) is not None else None,
+                                                 pocket_feat=condition_subset.pocket_feat[i] if getattr(condition_subset, 'pocket_feat', None) is not None else None,
+                                                 pocket_mask=condition_subset.pocket_mask[i] if getattr(condition_subset, 'pocket_mask', None) is not None else None)
                 
                 samples_i = self.sample_n_graphs(self.test_dense_data, samples_to_generate=self.test_sampling_num_per_graph,
                                                 chains_to_save=self.cfg.general.final_model_chains_to_save,
@@ -275,20 +355,27 @@ class FullDenoisingDiffusion(pl.LightningModule):
             condition_subset = self.test_dense_data          
             self.save_mols_and_pharmacophores(condition_subset)
             
+            num_targets = len(self.all_test_conditions) if hasattr(self, 'all_test_conditions') and len(self.all_test_conditions) > 0 else self.cfg.general.final_model_samples_to_generate
+            num_targets = min(self.cfg.general.final_model_samples_to_generate, num_targets)
+            print(f"Sampling K={self.test_sampling_num_per_graph} poses for {num_targets} test targets...")
             
-            
-            for i in range(self.cfg.general.final_model_samples_to_generate):
-                print(f"Sampling for mol with index {i}")
-                
-                condition = utils.PlaceHolder(X=None, charges=None, E=None, y=None,
-                                                 pos= None, node_mask=None,
-                                                 pharma_coord=condition_subset.pharma_coord[i],
-                                                 pharma_feat=condition_subset.pharma_feat[i],
-                                                 pharma_mask=condition_subset.pharma_mask[i],
-                                                 pharma_atom=condition_subset.pharma_atom[i],
-                                                 pharma_atom_pos=condition_subset.pharma_atom_pos[i],
-                                                 pharma_E=condition_subset.pharma_E[i],
-                                                 pharma_charge=condition_subset.pharma_charge[i])
+            for i in range(num_targets):
+                print(f"Sampling for mol with index {i}/{num_targets}")
+                if hasattr(self, 'all_test_conditions') and i < len(self.all_test_conditions):
+                    condition = self.all_test_conditions[i]
+                else:
+                    condition = utils.PlaceHolder(X=None, charges=None, E=None, y=None,
+                                                     pos= None, node_mask=None,
+                                                     pharma_coord=condition_subset.pharma_coord[i],
+                                                     pharma_feat=condition_subset.pharma_feat[i],
+                                                     pharma_mask=condition_subset.pharma_mask[i],
+                                                     pharma_atom=condition_subset.pharma_atom[i],
+                                                     pharma_atom_pos=condition_subset.pharma_atom_pos[i],
+                                                     pharma_E=condition_subset.pharma_E[i],
+                                                     pharma_charge=condition_subset.pharma_charge[i],
+                                                     pocket_pos=condition_subset.pocket_pos[i] if getattr(condition_subset, 'pocket_pos', None) is not None else None,
+                                                     pocket_feat=condition_subset.pocket_feat[i] if getattr(condition_subset, 'pocket_feat', None) is not None else None,
+                                                     pocket_mask=condition_subset.pocket_mask[i] if getattr(condition_subset, 'pocket_mask', None) is not None else None)
                 
                 samples_i = self.sample_n_graphs(self.test_dense_data, samples_to_generate=self.test_sampling_num_per_graph,
                                                 chains_to_save=self.cfg.general.final_model_chains_to_save,
@@ -298,12 +385,26 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 
                 mols_list.append(rdkit_mols)
                 samples.extend(samples_i)
+
+                # Periodic checkpoint save every 10 targets
+                if (i + 1) % 10 == 0 or (i + 1) == num_targets:
+                    with open('generated_mols_checkpoint.pkl', 'wb') as cf:
+                        pickle.dump(mols_list, cf)
             
         print("Saving the generated graphs")
         filename = f'generated_mols.pkl'
         
         with open(filename, 'wb') as f:
             pickle.dump(mols_list, f) 
+
+        out_dest = '/mnt/nas/keshaw/PharmaDiff/paper_records/phase1_benchmark/p2diff_multipose/generated_mols.pkl'
+        try:
+            os.makedirs(os.path.dirname(out_dest), exist_ok=True)
+            with open(out_dest, 'wb') as f_dest:
+                pickle.dump(mols_list, f_dest)
+            print(f"Also saved directly to {out_dest}")
+        except Exception as e:
+            print(f"Note: Could not copy directly to {out_dest}: {e}")
 
         print("Saved.")
         print("Computing sampling metrics...")
@@ -511,6 +612,14 @@ class FullDenoisingDiffusion(pl.LightningModule):
             chains.pharma_charge[-1] = pharma_charge[:keep_chain]
         
 
+        pocket_pos_tensor = None
+        if hasattr(data, 'pocket') and data.pocket is not None:
+            pocket_pos_tensor = getattr(data.pocket, 'pos', None)
+        elif isinstance(data, dict) and 'pocket' in data and data['pocket'] is not None:
+            pocket_pos_tensor = getattr(data['pocket'], 'pos', None)
+        elif hasattr(data, 'pocket_pos'):
+            pocket_pos_tensor = data.pocket_pos
+
         molecule_list = []
         for i in range(batch_size):
             mask = node_mask[i]  # Boolean mask for the nodes
@@ -521,11 +630,19 @@ class FullDenoisingDiffusion(pl.LightningModule):
             charge_vec = charges[i, mask]
             edge_types = E[i, mask][:, mask]  # Apply the mask for rows and columns
             conformer = pos[i, mask]
-            
+
+            pkt_p = None
+            if pocket_pos_tensor is not None:
+                if pocket_pos_tensor.dim() == 3 and i < pocket_pos_tensor.size(0):
+                    pkt_p = pocket_pos_tensor[i]
+                elif pocket_pos_tensor.dim() == 2:
+                    pkt_p = pocket_pos_tensor
+
             mol = Molecule(atom_types=atom_types, charges=charge_vec,
-                                        bond_types=edge_types, positions=conformer,
-                                        atom_decoder=self.dataset_infos.atom_decoder, 
-                                        pharma_feat=pharma_feat, pharma_coord=pharma_coord)
+                           bond_types=edge_types, positions=conformer,
+                           atom_decoder=self.dataset_infos.atom_decoder, 
+                           pharma_feat=pharma_feat, pharma_coord=pharma_coord,
+                           pocket_pos=pkt_p)
             
             molecule_list.append(mol)
 
@@ -550,6 +667,15 @@ class FullDenoisingDiffusion(pl.LightningModule):
         _ = visualizer.visualize(result_path, molecule_list, num_molecules_to_visualize=save_final)
         self.print("Visualizing done.")
         return molecule_list
+
+    def print(self, *args, **kwargs):
+        try:
+            if hasattr(self, '_trainer') and self._trainer is not None:
+                super().print(*args, **kwargs)
+            else:
+                print(*args, **kwargs)
+        except Exception:
+            print(*args, **kwargs)
 
     def sample_zs_from_zt(self, z_t, s_int, test = False):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
@@ -601,7 +727,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                     current_max_size = potential_max_size
                 else:
                     chains_save = max(min(chains_left_to_save, len(current_n_list)), 0)
-                    samples.extend(self.sample_batch(data, n_nodes=current_n_list, data=data, batch_id=i,
+                    samples.extend(self.sample_batch(data, n_nodes=current_n_list, batch_id=i,
                                                      save_final=len(current_n_list), keep_chain=chains_save,
                                                      number_chain_steps=self.number_chain_steps, test=test, 
                                                      sample_condition=sample_condition))
@@ -641,26 +767,39 @@ class FullDenoisingDiffusion(pl.LightningModule):
     def BS(self):
         return self.cfg.train.batch_size
 
-    def forward(self, z_t, extra_data, samples = None):
+    def forward(self, z_t, extra_data, samples = None, collect_diagnostics: bool = False):
         assert z_t.node_mask is not None
         model_input = z_t.copy()
         model_input.X = torch.cat((z_t.X, extra_data.X), dim=2).float()
         model_input.E = torch.cat((z_t.E, extra_data.E), dim=3).float()
         model_input.y = torch.hstack((z_t.y, extra_data.y, z_t.t)).float()
-        return self.model(model_input, samples= samples)
+        return self.model(model_input, samples=samples, collect_diagnostics=collect_diagnostics)
 
     def on_train_epoch_end(self) -> None:
         self.print(f"Train epoch {self.current_epoch} ends")
         tle_log = self.train_loss.log_epoch_metrics()
+        epoch_micros = self.train_micrometrics_tracker.compute()
+        self.train_micrometrics_tracker.reset()
+
+        atom_acc = epoch_micros.get('chem/atom_acc_all', -1.0)
+        bond_rec = epoch_micros.get('chem/bond_recall_existing', -1.0)
+        drift = epoch_micros.get('geom/pharma_anchor_drift_mean', -1.0)
+        clash = epoch_micros.get('geom/internal_clash_rate', -1.0)
+
         self.print(f"Epoch {self.current_epoch} finished: pos: {tle_log['train_epoch/pos_mse'] :.2f} -- "
-                   f"X: {tle_log['train_epoch/x_CE'] :.2f} --"
-                   f" charges: {tle_log['train_epoch/charges_CE']:.2f} --"
-                   f" E: {tle_log['train_epoch/E_CE'] :.2f} --"
-                   f" y: {tle_log['train_epoch/y_CE'] :.2f} -- {time.time() - self.start_epoch_time:.1f}s "
+                   f"X: {tle_log['train_epoch/x_CE'] :.2f} -- "
+                   f"charges: {tle_log['train_epoch/charges_CE']:.2f} -- "
+                   f"E: {tle_log['train_epoch/E_CE'] :.2f} -- "
                    f"p_pos: {tle_log['train_epoch/pharma_pos_mse']:.2f} -- "
-                   f"p_X: {tle_log['train_epoch/pharma_X_CE']:.2f} -- "
-                   f"p_charges: {tle_log['train_epoch/pharma_charges_CE']:.2f} -- ")
+                   f"atom_acc: {atom_acc:.3f} -- bond_rec: {bond_rec:.3f} -- "
+                   f"drift: {drift:.3f}Å -- clash: {clash:.3f} -- {time.time() - self.start_epoch_time:.1f}s")
         self.log_dict(tle_log, batch_size=self.BS)
+        if epoch_micros:
+            micro_epoch_log = {f"train_epoch_micro/{k}": v for k, v in epoch_micros.items()}
+            self.log_dict(micro_epoch_log, batch_size=self.BS)
+            if wandb.run:
+                wandb.log(micro_epoch_log, commit=False)
+
         # if self.local_rank == 0:
         tme_log = self.train_metrics.log_epoch_metrics(self.current_epoch, self.local_rank)
         if tme_log is not None:
@@ -673,6 +812,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.start_epoch_time = time.time()
         self.train_loss.reset()
         self.train_metrics.reset()
+        self.train_micrometrics_tracker.reset()
 
     def on_fit_start(self) -> None:
         self.train_iterations = 100      # TODO: fix -- previously was len(self.trainer.datamodule.train_dataloader())
@@ -810,7 +950,8 @@ class FullDenoisingDiffusion(pl.LightningModule):
             
             
             for j in range(len(ref_labels)):
-                feat = PHARMACOPHORE_FAMILES_TO_KEEP[int(ref_labels[j])]
+                lbl = ref_labels[j].item() if hasattr(ref_labels[j], 'item') else ref_labels[j][0]
+                feat = PHARMACOPHORE_FAMILES_TO_KEEP[int(lbl)]
                 pharmacophore.append({"type": feat, "coords": ref_coords[j]})
 
 

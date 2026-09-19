@@ -98,12 +98,12 @@ class TrainLoss(nn.Module):
     def log_epoch_metrics(self):
         epoch_pos_loss = self.train_pos_mse.compute().item() if self.train_pos_mse.total > 0 else -1.0
         epoch_node_loss = self.node_loss.compute().item() if self.node_loss.total_samples > 0 else -1.0
-        epoch_charges_loss = self.charges_loss.compute().item() if self.charges_loss > 0 else -1.0
+        epoch_charges_loss = self.charges_loss.compute().item() if self.charges_loss.total_samples > 0 else -1.0
         epoch_edge_loss = self.edge_loss.compute().item() if self.edge_loss.total_samples > 0 else -1.0
-        epoch_y_loss = self.train_y_loss.compute().item() if self.y_loss.total_samples > 0 else -1.0
+        epoch_y_loss = self.y_loss.compute().item() if self.y_loss.total_samples > 0 else -1.0
         epoch_pharma_pos_loss = self.train_pharma_pos.compute().item() if self.train_pharma_pos.total > 0 else -1.0
         epoch_pharma_X_loss = self.train_pharma_X.compute().item() if self.train_pharma_X.total_samples > 0 else -1.0
-        epoch_pharma_charges_loss = self.train_pharma_charges.compute().item() if self.train_pharma_charges > 0 else -1.0
+        epoch_pharma_charges_loss = self.train_pharma_charges.compute().item() if self.train_pharma_charges.total_samples > 0 else -1.0
 
         to_log = {"train_epoch/pos_mse": epoch_pos_loss,
                   "train_epoch/x_CE": epoch_node_loss,

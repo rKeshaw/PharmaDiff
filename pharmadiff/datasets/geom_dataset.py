@@ -92,6 +92,9 @@ class GeomDrugsDataset(InMemoryDataset):
                     f'test_angles_{h}.npy', 'test_smiles.pickle', 'goem_test_smiles_noh.pickle']
 
     def download(self):
+        from torch_geometric.data.dataset import files_exist
+        if files_exist(self.processed_paths):
+            return
         raise ValueError('Download and preprocessing is manual. If the data is already downloaded, '
                          f'check that the paths are correct. Root dir = {self.root} -- raw files {self.raw_paths}')
 
@@ -177,8 +180,12 @@ class GeomDrugsDataset(InMemoryDataset):
 class GeomDataModule(AbstractAdaptiveDataModule):
     def __init__(self, cfg):
         self.datadir = cfg.dataset.datadir
-        base_path = pathlib.Path(get_original_cwd()).parents[0]
-        root_path = os.path.join(base_path, self.datadir)
+        try:
+            cwd = pathlib.Path(get_original_cwd())
+        except Exception:
+            cwd = pathlib.Path.cwd()
+        repo_root = cwd.parent if cwd.name == "pharmadiff" else cwd
+        root_path = os.path.join(repo_root, self.datadir)
 
         train_dataset = GeomDrugsDataset(split='train', root=root_path, remove_h=cfg.dataset.remove_h)
         val_dataset = GeomDrugsDataset(split='val', root=root_path, remove_h=cfg.dataset.remove_h)

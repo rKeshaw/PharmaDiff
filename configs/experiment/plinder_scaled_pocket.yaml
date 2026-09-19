@@ -1,0 +1,64 @@
+# @package _global_
+# configs/experiment/plinder_scaled_pocket.yaml
+#
+# Scaled PLINDER experiment with joint protein pocket + pharmacophore conditioning.
+# Dataset: data/plinder_scaled/
+#   - Train: 3,083 complexes (14.7x scaling)
+#   - Val:   153 complexes (100% of PLINDER validation)
+#   - Test:  112 complexes (10.5x scaling)
+#
+# Stochastic mini-batching:
+#   - batch_size: 32 (~180 gradient steps per epoch)
+#   - Total gradient updates over 500 epochs: ~90,000 steps
+
+general:
+    name: 'plinder-scaled-pocket'
+    gpus: 1
+    wandb: 'offline'
+    test_only: null
+    evaluate_all_checkpoints: False
+
+    sample_every_val: 50
+    samples_to_generate: 64
+    samples_to_save: 10
+    chains_to_save: 1
+
+    final_model_samples_to_generate: 250
+    final_model_samples_to_save: 0
+    final_model_chains_to_save: 0
+    num_final_sampling: 1
+    test_sampling_num_per_graph: 1000
+
+    check_val_every_n_epochs: 1
+    log_every_steps: 10
+    number_chain_steps: 50
+    faster_sampling: 1
+
+train:
+    n_epochs: 500
+    batch_size: 32
+    reference_batch_size: 32
+    save_model: True
+    save_top_k: 3
+    clip_grad: 1.0
+
+model:
+    n_layers: 12
+    use_pocket: True
+    pocket_feat_dim: 21
+    lambda_train: [5, 0.6, 1, 4, 0, 3.0, 0.2, 0.5]
+    nu:
+      p: 2.5
+      x: 1
+      c: 1
+      e: 1.5
+      y: 1
+
+dataset:
+    name: 'plinder'
+    datadir: 'data/plinder_scaled/'
+    use_pocket: True
+    remove_h: True
+    random_subset: null
+    pin_memory: True
+    adaptive_loader: True

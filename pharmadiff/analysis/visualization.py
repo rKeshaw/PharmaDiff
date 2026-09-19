@@ -9,6 +9,7 @@ import numpy as np
 import wandb
 import imageio
 import matplotlib.pyplot as plt
+from rdkit import Chem
 from rdkit.Chem import Draw, AllChem
 from rdkit.Geometry import Point3D
 from rdkit import RDLogger
@@ -58,9 +59,10 @@ def plot_save_molecule(mol, save_path, conformer2d=None):
     new_im.paste(pil3d, (0, 0, 300, 300))
     try:
         pil2d = generatePIL2d(mol.rdkit_mol, conformer2d)
-        new_im.paste(pil2d, (300, 0, 600, 300))
-    except (ValueError, RuntimeError) as e:
-        print("Value error in generate PIL2D. Saving 3D view only.")
+        if pil2d is not None:
+            new_im.paste(pil2d, (300, 0, 600, 300))
+    except Exception as e:
+        print(f"Error in generate PIL2D: {e}. Saving 3D view only.")
 
     draw = ImageDraw.Draw(new_im)
     real_path = os.path.realpath(__file__)
@@ -78,16 +80,48 @@ def plot_save_molecule(mol, save_path, conformer2d=None):
 def generatePIL2d(mol, conformer2d=None):
     """ mol: RdKit molecule object
         conformer2d: n x 3 tensor defining the coordinates which should be used to plot (used for chains vis). """
-    if conformer2d is None:
-        AllChem.Compute2DCoords(mol)
-    conf = mol.GetConformer()
-    if conformer2d is not None:
-        conformer2d = conformer2d.double()
-        for j, atom in enumerate(mol.GetAtoms()):
-            x, y, z = conformer2d[j, 0].item(), conformer2d[j, 1].item(), conformer2d[j, 2].item()
+    if mol is None:
+        img = PIL.Image.new('RGB', (300, 300), color='white')
+        draw = ImageDraw.Draw(img)
+        draw.text((60, 140), "Invalid / None Molecule", fill='gray')
+        return img
 
+    mol_copy = Chem.Mol(mol)
+    if conformer2d is None:
+        try:
+            AllChem.Compute2DCoords(mol_copy)
+        except Exception:
+            try:
+                from rdkit.Chem import rdCoordGen
+                rdCoordGen.AddCoords(mol_copy)
+            except Exception:
+                pass
+    else:
+        if mol_copy.GetNumConformers() == 0:
+            conf = Chem.Conformer(mol_copy.GetNumAtoms())
+            mol_copy.AddConformer(conf)
+        else:
+            conf = mol_copy.GetConformer()
+        conformer2d = conformer2d.double()
+        n_atoms = min(mol_copy.GetNumAtoms(), conformer2d.size(0))
+        for j in range(n_atoms):
+            x, y, z = conformer2d[j, 0].item(), conformer2d[j, 1].item(), conformer2d[j, 2].item()
             conf.SetAtomPosition(j, Point3D(x, y, z))
-    return Draw.MolToImage(mol)
+
+    try:
+        return Draw.MolToImage(mol_copy, size=(300, 300))
+    except Exception:
+        try:
+            return Draw.MolToImage(mol_copy, size=(300, 300), kekulize=False)
+        except Exception:
+            try:
+                Chem.SanitizeMol(mol_copy, Chem.SANITIZE_ALL ^ Chem.SANITIZE_KEKULIZE)
+                return Draw.MolToImage(mol_copy, size=(300, 300), kekulize=False)
+            except Exception:
+                img = PIL.Image.new('RGB', (300, 300), color='white')
+                draw = ImageDraw.Draw(img)
+                draw.text((70, 140), "2D depiction failed", fill='gray')
+                return img
 
 
 def visualize_chains(path, chain, atom_decoder, num_nodes):
@@ -127,9 +161,8 @@ def visualize_chains(path, chain, atom_decoder, num_nodes):
             coords.append([p.x, p.y, p.z])
         conformer2d = torch.Tensor(coords)
 
-        for frame in range(len(mols)):
-            all_file_paths = visualize(result_path, mols, num_molecules_to_visualize=-1, log=None,
-                                       conformer2d=conformer2d, file_prefix='frame')
+        all_file_paths = visualize(result_path, mols, num_molecules_to_visualize=-1, log=None,
+                                   conformer2d=conformer2d, file_prefix='frame')
 
 
 

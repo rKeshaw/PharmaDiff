@@ -24,14 +24,19 @@ class XEyTransformerLayer(nn.Module):
         dim_feedforward: the dimension of the feedforward network model after self-attention
         dropout: dropout probablility. 0 to disable
         layer_norm_eps: eps value in layer normalizations.
+        use_pocket: whether to integrate pocket cross-attention
+        pocket_feat_dim: dimension of pocket features (default 21)
     """
     def __init__(self, dx: int, de: int, dy: int, n_head: int, dim_ffX: int = 2048,
                  dim_ffE: int = 128, dim_ffy: int = 2048, dropout: float = 0.1,
-                 layer_norm_eps: float = 1e-5, device=None, dtype=None, last_layer=False) -> None:
+                 layer_norm_eps: float = 1e-5, device=None, dtype=None, last_layer=False,
+                 use_pocket: bool = False, pocket_feat_dim: int = 21) -> None:
         kw = {'device': device, 'dtype': dtype}
         super().__init__()
 
-        self.self_attn = NodeEdgeBlock(dx, de, dy, n_head, last_layer=last_layer)
+        self.use_pocket = use_pocket
+        self.self_attn = NodeEdgeBlock(dx, de, dy, n_head, last_layer=last_layer,
+                                       use_pocket=use_pocket, pocket_feat_dim=pocket_feat_dim)
 
         self.linX1 = Linear(dx, dim_ffX, **kw)
         self.linX2 = Linear(dim_ffX, dx, **kw)
@@ -91,10 +96,14 @@ class XEyTransformerLayer(nn.Module):
         
         pharma_feat = features.pharma_feat
         pharma_atom = features.pharma_atom
-        
+
+        pocket_pos = getattr(features, 'pocket_pos', None)
+        pocket_feat = getattr(features, 'pocket_feat', None)
+        pocket_mask = getattr(features, 'pocket_mask', None)
         
         newX, newE, new_y, vel = self.self_attn(X, E, y, pos, node_mask=node_mask, 
-                                                pharma_mask=pharma_mask, pharma_pos=pharma_pos, pharma_atom=pharma_atom)
+                                                pharma_mask=pharma_mask, pharma_pos=pharma_pos, pharma_atom=pharma_atom,
+                                                pocket_pos=pocket_pos, pocket_feat=pocket_feat, pocket_mask=pocket_mask)
 
         newX_d = self.dropoutX1(newX)
         # X = self.normX1(X + newX_d, x_mask)
@@ -146,14 +155,15 @@ class XEyTransformerLayer(nn.Module):
         out = utils.PlaceHolder(X=X, E=E, y=y, pos=new_pos, charges=None, node_mask=node_mask, 
                                 pharma_coord=None, pharma_feat=pharma_feat, 
                                 pharma_mask=pharma_mask, pharma_atom=pharma_atom, 
-                                pharma_atom_pos=pharma_pos).mask()
+                                pharma_atom_pos=pharma_pos,
+                                pocket_pos=pocket_pos, pocket_feat=pocket_feat, pocket_mask=pocket_mask).mask()
 
         return out
 
 
 class NodeEdgeBlock(nn.Module):
     """ Self attention layer that also updates the representations on the edges. """
-    def __init__(self, dx, de, dy, n_head, last_layer=False):
+    def __init__(self, dx, de, dy, n_head, last_layer=False, use_pocket=False, pocket_feat_dim=21):
         super().__init__()
         assert dx % n_head == 0, f"dx: {dx} -- nhead: {n_head}"
         self.dx = dx
@@ -161,6 +171,7 @@ class NodeEdgeBlock(nn.Module):
         self.dy = dy
         self.df = int(dx / n_head)
         self.n_head = n_head
+        self.use_pocket = use_pocket
 
         self.in_E = Linear(de, de)
 
@@ -200,6 +211,20 @@ class NodeEdgeBlock(nn.Module):
         self.v_cross = Linear(dx, dx)
         self.a_cross = Linear(dx, n_head, bias=False)
         self.out_cross = Linear(dx * n_head, dx)
+
+        # Pocket cross attention (bipartite attention with distance bias)
+        if self.use_pocket:
+            self.mlp_in_pocket = nn.Sequential(
+                Linear(pocket_feat_dim, dx),
+                nn.ReLU(),
+                Linear(dx, dx)
+            )
+            self.k_pocket = Linear(dx, dx)
+            self.q_pocket = Linear(dx, dx)
+            self.v_pocket = Linear(dx, dx)
+            self.a_pocket = Linear(dx, n_head, bias=False)
+            self.dist_pocket = Linear(1, n_head)
+            self.out_pocket = Linear(dx * n_head, dx)
 
         # Incorporate e to x
         # self.e_att_add = Linear(de, n_head)
@@ -252,7 +277,8 @@ class NodeEdgeBlock(nn.Module):
         if not last_layer:
             self.y_out = nn.Sequential(nn.Linear(dy, dy), nn.ReLU(), nn.Linear(dy, dy))
             
-    def forward(self, X, E, y, pos, node_mask, pharma_mask, pharma_pos, pharma_atom):
+    def forward(self, X, E, y, pos, node_mask, pharma_mask, pharma_pos, pharma_atom,
+                pocket_pos=None, pocket_feat=None, pocket_mask=None):
         """ :param X: bs, n, d        node features
             :param E: bs, n, n, d     edge features
             :param y: bs, dz           global features
@@ -280,20 +306,6 @@ class NodeEdgeBlock(nn.Module):
         norm1 = self.lin_norm_pos1(norm_pos)             # bs, n, de
         norm2 = self.lin_norm_pos2(norm_pos)             # bs, n, de
         dist1 = F.relu(self.lin_dist1(pos_info) + norm1.unsqueeze(2) + norm2.unsqueeze(1)) * e_mask1 * e_mask2
-        
-        
-        # # 0.1 Create a distance matrix for pharmacophores
-        # pharma_pos = pharma_pos * p_mask
-        # p_norm_pos = torch.norm(pharma_pos, dim=-1, keepdim=True)         # bs, n, 1
-        # p_normalized_pos = pharma_pos / (p_norm_pos + 1e-7)                 # bs, n, 3
-
-        # p_pairwise_dist = torch.cdist(pharma_pos, pharma_pos).unsqueeze(-1).float()
-        # p_cosines = torch.sum(p_normalized_pos.unsqueeze(1) * p_normalized_pos.unsqueeze(2), dim=-1, keepdim=True)
-        # p_pos_info = torch.cat((p_pairwise_dist, p_cosines), dim=-1)
-
-        # p_norm1 = self.p_lin_norm_pos1(p_norm_pos)             # bs, n, de
-        # p_norm2 = self.p_lin_norm_pos2(norm_pos)               # bs, n, de
-        # p_dist1 = F.relu(self.p_lin_dist1(p_pos_info) + p_norm1.unsqueeze(2) + p_norm2.unsqueeze(1)) * pe_mask1 * pe_mask2
 
         # 1. Process E
         Y = self.in_E(E)
@@ -302,13 +314,6 @@ class NodeEdgeBlock(nn.Module):
         x_e_mul1 = self.x_e_mul1(X) * x_mask
         x_e_mul2 = self.x_e_mul2(X) * x_mask
         Y = Y * x_e_mul1.unsqueeze(1) * x_e_mul2.unsqueeze(2) * e_mask1 * e_mask2
-        
-        # # 1.2. Incorporate pharma distances
-        #p_dist_add = self.p_dist_add_e(p_dist1)
-        #p_dist_mul = self.p_dist_mul_e(p_dist1)
-        #Y_p = (Y + p_dist_add + Y * p_dist_mul) * pe_mask1 * pe_mask2   # bs, n, n, dx
-        # #Y = Y + Y_p
-        
         
         # 1.2. Incorporate distances
         dist_add = self.dist_add_e(dist1)
@@ -321,7 +326,7 @@ class NodeEdgeBlock(nn.Module):
         E = (Y + y_e_add + Y * y_e_mul) * e_mask1 * e_mask2
 
         # Output E
-        Eout = self.e_out(E) * e_mask1 * e_mask2      # bs, n, n, de
+        Eout = torch.nan_to_num(self.e_out(E), nan=0.0) * e_mask1 * e_mask2      # bs, n, n, de
         diffusion_utils.assert_correctly_masked(Eout, e_mask1 * e_mask2)
 
         # 2. Process the node features
@@ -377,10 +382,37 @@ class NodeEdgeBlock(nn.Module):
         weighted_V_c = weighted_V_c.flatten(start_dim=2)                          # bs, n, n_head x dx
         weighted_V_c = self.out_cross(weighted_V_c) * p_mask                      # bs, n, dx
         
-        
         weighted_V = weighted_V * ~p_mask + weighted_V_c * p_mask
-        
-        
+
+        # 2.5 Pocket Bipartite Cross-Attention (if use_pocket is active)
+        if self.use_pocket and pocket_pos is not None and pocket_feat is not None and pocket_mask is not None:
+            pk_mask = pocket_mask.unsqueeze(-1)                          # bs, M, 1
+            H_pocket = self.mlp_in_pocket(pocket_feat) * pk_mask          # bs, M, dx
+
+            Q_p = (self.q_pocket(weighted_V) * x_mask).unsqueeze(2)     # bs, n, 1, dx
+            K_p = (self.k_pocket(H_pocket) * pk_mask).unsqueeze(1)       # bs, 1, M, dx
+            prod_p = Q_p * K_p / math.sqrt(self.df)                      # bs, n, M, dx
+            prod_p = prod_p - prod_p.max(dim=-1, keepdim=True)[0]
+            a_p = self.a_pocket(prod_p)                                  # bs, n, M, n_head
+
+            # Distance bias: nearer pocket atoms exert stronger attention
+            dist_lp = torch.cdist(pos, pocket_pos).unsqueeze(-1)         # bs, n, M, 1
+            dist_bias = self.dist_pocket(dist_lp)                        # bs, n, M, n_head
+            a_p = a_p - F.relu(dist_bias)
+
+            # Masked softmax over pocket nodes (dimension 2)
+            attn_mask_p = pocket_mask.unsqueeze(1).unsqueeze(-1).expand(-1, n, -1, self.n_head)
+            alpha_p = masked_softmax(a_p, attn_mask_p, dim=2).unsqueeze(-1)  # bs, n, M, n_head, 1
+
+            has_pocket = pocket_mask.any(dim=-1, keepdim=True).unsqueeze(-1)    # bs, 1, 1
+            V_p = (self.v_pocket(H_pocket) * pk_mask).unsqueeze(1).unsqueeze(3) # bs, 1, M, 1, dx
+            weighted_V_p = (alpha_p * V_p).sum(dim=2).flatten(start_dim=2)      # bs, n, n_head * dx
+            weighted_V_p = self.out_pocket(weighted_V_p) * x_mask * has_pocket.float() # bs, n, dx
+
+            # Soft residual fusion into ligand node representation
+            weighted_V = weighted_V + weighted_V_p
+
+
         # Incorporate E to X
         e_x_mul = self.e_x_mul(E, e_mask2)
         weighted_V = weighted_V + e_x_mul * weighted_V
@@ -395,7 +427,7 @@ class NodeEdgeBlock(nn.Module):
         newX = weighted_V * (yx2 + 1) + yx1
 
         # Output X
-        Xout = self.x_out(newX) * x_mask
+        Xout = torch.nan_to_num(self.x_out(newX), nan=0.0) * x_mask
         diffusion_utils.assert_correctly_masked(Xout, x_mask)
 
         # Process y based on X and E
@@ -417,7 +449,17 @@ class NodeEdgeBlock(nn.Module):
         #Y_m = torch.cat((Y, Y_p), dim=-1)                    # bs, n, n, de
         messages = self.e_pos2(F.relu(self.e_pos1(Y)))       # bs, n, n, 1, 2
         vel = (messages * delta_pos).sum(dim=2) * x_mask
-        
+
+        # Pocket steric boundary awareness (if use_pocket is active)
+        if self.use_pocket and pocket_pos is not None and pocket_mask is not None:
+            pk_mask = pocket_mask.unsqueeze(-1)                           # bs, M, 1
+            dist_lp = torch.cdist(pos, pocket_pos).unsqueeze(-1)          # bs, n, M, 1
+            delta_pos_p = pos.unsqueeze(2) - pocket_pos.unsqueeze(1)      # bs, n, M, 3
+            steric_push = torch.sigmoid((2.0 - dist_lp) * 3.0) * pk_mask.unsqueeze(1)
+            dir_p = delta_pos_p / (dist_lp + 1e-6)
+            vel_steric = (steric_push * dir_p).sum(dim=2) * x_mask        # bs, n, 3
+            vel = vel + vel_steric
+
         vel, _ = utils.remove_mean_with_mask(vel, node_mask)
         return Xout, Eout, y_out, vel
 
@@ -428,7 +470,7 @@ class GraphTransformer(nn.Module):
     dims : dict -- contains dimensions for each feature type
     """
     def __init__(self, input_dims: utils.PlaceHolder, n_layers: int, hidden_mlp_dims: dict, hidden_dims: dict,
-                 output_dims: utils.PlaceHolder):
+                 output_dims: utils.PlaceHolder, use_pocket: bool = False, pocket_feat_dim: int = 21):
         super().__init__()
         self.n_layers = n_layers
         self.out_dim_X = output_dims.X
@@ -437,6 +479,7 @@ class GraphTransformer(nn.Module):
         self.out_dim_charges = output_dims.charges
         self.input_dims = input_dims
         self.outdim = output_dims
+        self.use_pocket = use_pocket
 
         act_fn_in = nn.ReLU()
         act_fn_out = nn.ReLU()
@@ -460,8 +503,9 @@ class GraphTransformer(nn.Module):
                                                             n_head=hidden_dims['n_head'],
                                                             dim_ffX=hidden_dims['dim_ffX'],
                                                             dim_ffE=hidden_dims['dim_ffE'],
-                                                            last_layer=False)     # needed to load old checkpoints
-                                                            # last_layer=(i == n_layers - 1))
+                                                            last_layer=False,
+                                                            use_pocket=use_pocket,
+                                                            pocket_feat_dim=pocket_feat_dim)
                                         for i in range(n_layers)])
         
         
@@ -474,7 +518,7 @@ class GraphTransformer(nn.Module):
         #                                nn.Linear(hidden_mlp_dims['y'], output_dims.y))
         self.mlp_out_pos = PositionsMLP(hidden_mlp_dims['pos'])
 
-    def forward(self, data: utils.PlaceHolder, samples = None):
+    def forward(self, data: utils.PlaceHolder, samples = None, collect_diagnostics: bool = False):
 
         bs, n = data.X.shape[0], data.X.shape[1]
         node_mask = data.node_mask
@@ -540,15 +584,41 @@ class GraphTransformer(nn.Module):
         
         X_masked = torch.where(data.pharma_mask.unsqueeze(-1) > 0, feats_atoms, new_X) 
         
+        pocket_pos = getattr(data, 'pocket_pos', None) if self.use_pocket else None
+        pocket_feat = getattr(data, 'pocket_feat', None) if self.use_pocket else None
+        pocket_mask = getattr(data, 'pocket_mask', None) if self.use_pocket else None
+
         features = utils.PlaceHolder(X=X_masked, E=new_E, y=self.mlp_in_y(data.y), charges=None,
                                      pos=pos_masked, node_mask=node_mask,
                                      pharma_coord=data.pharma_coord, pharma_feat=data.pharma_feat,
                                      pharma_mask=data.pharma_mask, pharma_atom=feats_atoms, 
-                                     pharma_atom_pos=pharma_pos).mask()    
+                                     pharma_atom_pos=pharma_pos,
+                                     pocket_pos=pocket_pos, pocket_feat=pocket_feat,
+                                     pocket_mask=pocket_mask).mask()    
         
 
-        for layer in self.tf_layers:
+        diagnostics = {} if collect_diagnostics else None
+        num_layers = len(self.tf_layers)
+        mid_layer = num_layers // 2
+        last_layer = num_layers - 1
+
+        for idx, layer in enumerate(self.tf_layers):
             features = layer(features)
+            if collect_diagnostics and idx in [0, mid_layer, last_layer]:
+                if idx == 0:
+                    suffix = "l0"
+                elif idx == last_layer:
+                    suffix = "lout"
+                else:
+                    suffix = "lmid"
+                with torch.no_grad():
+                    norm_X = torch.norm(features.X, dim=-1)[node_mask].mean().item()
+                    pair_mask = diag_mask.squeeze(-1) & node_mask.unsqueeze(-1) & node_mask.unsqueeze(-2)
+                    norm_E = torch.norm(features.E, dim=-1)[pair_mask].mean().item() if pair_mask.any() else 0.0
+                    diagnostics[f"norm_X_{suffix}"] = norm_X
+                    diagnostics[f"norm_E_{suffix}"] = norm_E
+
+        self.last_diagnostics = diagnostics
             
         #X_to_decode = features.X + features.pharma_atom
         X = self.mlp_out_X(features.X)
@@ -571,7 +641,9 @@ class GraphTransformer(nn.Module):
                                 pharma_coord=data.pharma_coord, pharma_feat=data.pharma_feat, 
                                 pharma_mask=data.pharma_mask, pharma_atom=data.pharma_atom, 
                                 pharma_atom_pos=data.pharma_atom_pos, pharma_E = data.pharma_E, 
-                                pharma_charge= data.pharma_charge).mask()
+                                pharma_charge= data.pharma_charge,
+                                pocket_pos=pocket_pos, pocket_feat=pocket_feat,
+                                pocket_mask=pocket_mask).mask()
             
             
             
@@ -585,7 +657,7 @@ class GraphTransformer(nn.Module):
                 
                 
                 noise_E = torch.randn_like(features.E) * noise_std * ~square_p_mask
-                noised_E = (features.E + noise_E) * diag_mask
+                noise_E = (features.E + noise_E) * diag_mask
                 
                 noise_pos = torch.randn_like(features.pos) * noise_std * ~p_mask
                 noised_pos = (features.pos + noise_pos) * node_mask.unsqueeze(-1)
@@ -607,7 +679,9 @@ class GraphTransformer(nn.Module):
                                         pharma_coord=data.pharma_coord, pharma_feat=data.pharma_feat, 
                                         pharma_mask=data.pharma_mask, pharma_atom=data.pharma_atom, 
                                         pharma_atom_pos=data.pharma_atom_pos, pharma_E = data.pharma_E, 
-                                        pharma_charge=data.pharma_charge).mask()
+                                        pharma_charge=data.pharma_charge,
+                                        pocket_pos=pocket_pos, pocket_feat=pocket_feat,
+                                        pocket_mask=pocket_mask).mask()
                 outputs.append(out)
             return outputs
         
